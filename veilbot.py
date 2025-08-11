@@ -1640,13 +1640,22 @@ class UnveilDropdown(discord.ui.Select):
             ensure_user_entry(guesser_id, guild_id)
             refill_user_coins(guesser_id, guild_id)
             if get_user_coins(guesser_id, guild_id) < 5:
+                veilcoinemoji = str(client.app_emojis["veilcoin"])
+
+                # show a one-button view to pop the store
+                view = discord.ui.View()
+                view.add_item(StoreButton())  # re-use your existing button class
+
                 return await interaction.edit_original_response(
                     embed=discord.Embed(
                         title=f"{incorrectmoji} Not Enough Coins",
-                        description=f"You don't have enough **Veil Coins** to make a guess.\nEach guess costs **5 coins** {veilcoinemoji}",
+                        description=(
+                            "You don't have enough **Veil Coins** to make a guess.\n"
+                            f"Each guess costs **5** {veilcoinemoji}.\n\n"
+                            "Need more coins? **Open the Store** below."),
                         color=0x992d22
                     ),
-                    view=None
+                    view=view
                 )
             if not deduct_user_coins(guesser_id, guild_id, 5):
                 return await interaction.edit_original_response(
@@ -1657,6 +1666,7 @@ class UnveilDropdown(discord.ui.Select):
                     ),
                     view=None
                 )
+
 
         # 3) DB work (race-safe)
         with get_safe_cursor() as cur:
