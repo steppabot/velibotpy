@@ -1620,7 +1620,7 @@ class UnveilDropdown(discord.ui.Select):
         try:
             await interaction.response.edit_message(
                 embed=discord.Embed(
-                    title="Checking Gues",
+                    title="Checking Guess",
                     description="Checking your guess and updating the veil.",
                     color=0xeeac00
                 ),
