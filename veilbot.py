@@ -253,31 +253,10 @@ async def on_ready():
     # Persistent view(s)
     client.add_view(WelcomeView())
     client.add_view(StoreView())
+    await hydrate_latest_views()
 
 
-    # ♻️ Restore only the latest veil messages
-    if conn:
-        with get_safe_cursor() as cur:
-            cur.execute("SELECT DISTINCT channel_id FROM latest_veil_messages")
-            channels = cur.fetchall()
 
-        for (channel_id,) in channels:
-            latest_id = get_latest_message_id(channel_id)
-            if not latest_id:
-                continue
-
-            channel = client.get_channel(channel_id)
-            if not channel:
-                continue
-
-            try:
-                msg = await channel.fetch_message(latest_id)
-                # ✅ Ensure latest veil has an active view
-                await msg.edit(view=VeilView())
-            except discord.NotFound:
-                print(f"⚠️ Latest veil {latest_id} in channel {channel_id} not found.")
-            except discord.HTTPException as e:
-                print(f"⚠️ Failed to restore latest veil {latest_id}: {e}")
 
 SUPPORT_SERVER_ID = 1394932709394087946  # Your support server ID
 SUPPORT_CHANNEL_ID = 1399973286649008158  # The channel where webhook posts
@@ -1293,6 +1272,32 @@ def claim_next_veil_number(channel_id: int) -> int:
         """, (channel_id,))
         row = cur.fetchone()
     return int(row[0]) if row else 1
+
+async def hydrate_latest_views():
+    if not conn:
+        return
+    with get_safe_cursor() as cur:
+        cur.execute("SELECT DISTINCT channel_id FROM latest_veil_messages")
+        channels = [row[0] for row in cur.fetchall()]
+
+    for channel_id in channels:
+        latest_id = get_latest_message_id(channel_id)
+        if not latest_id:
+            continue
+
+        channel = client.get_channel(channel_id)
+        if not channel:
+            continue
+
+        try:
+            msg = await channel.fetch_message(latest_id)
+            # Use the DB-aware view so guesses/submitted-by/veil # are correct
+            v = build_frozen_view(latest_id, channel.guild)
+            await msg.edit(view=(v or VeilView()))
+        except discord.NotFound:
+            print(f"⚠️ Latest veil {latest_id} in channel {channel_id} not found.")
+        except discord.HTTPException as e:
+            print(f"⚠️ Failed to restore latest veil {latest_id}: {e}")
 
 async def send_veil_message(interaction, text, channel, unveiled=False, return_file=False, veil_msg_id=None):
     channel_id = get_veil_channel(interaction.guild.id)
