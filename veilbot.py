@@ -2670,17 +2670,16 @@ class LeaderboardButton(Button):
 
         # Badges: 1–3 = medals, 4–10 = your custom emojis (fallback -> 🏅)
         badge = {
-            1: "🥇",
-            2: "🥈",
-            3: "🥉",
-            4: str(client.app_emojis.get("4th", "🏅")),
-            5: str(client.app_emojis.get("5th", "🏅")),
-            6: str(client.app_emojis.get("6th", "🏅")),
-            7: str(client.app_emojis.get("7th", "🏅")),
-            8: str(client.app_emojis.get("8th", "🏅")),
-            9: str(client.app_emojis.get("9th", "🏅")),
-            10: str(client.app_emojis.get("10th", "🏅")),
+            1: "🥇", 2: "🥈", 3: "🥉",
+            4: str(client.app_emojis["4th"]),
+            5: str(client.app_emojis["5th"]),
+            6: str(client.app_emojis["6th"]),
+            7: str(client.app_emojis["7th"]),
+            8: str(client.app_emojis["8th"]),
+            9: str(client.app_emojis["9th"]),
+            10: str(client.app_emojis["10th"]),
         }
+
 
         def fmt(n):
             try: return f"{int(n):,}"
@@ -3073,16 +3072,14 @@ async def leaderboard(interaction: discord.Interaction):
 
     # Badges: 1–3 medals, 4–10 your custom participation emojis (fallback 🏅)
     badge = {
-        1: "🥇",
-        2: "🥈",
-        3: "🥉",
-        4: str(client.app_emojis.get("4th", "🏅")),
-        5: str(client.app_emojis.get("5th", "🏅")),
-        6: str(client.app_emojis.get("6th", "🏅")),
-        7: str(client.app_emojis.get("7th", "🏅")),
-        8: str(client.app_emojis.get("8th", "🏅")),
-        9: str(client.app_emojis.get("9th", "🏅")),
-        10: str(client.app_emojis.get("10th", "🏅")),
+        1: "🥇", 2: "🥈", 3: "🥉",
+        4: str(client.app_emojis["4th"]),
+        5: str(client.app_emojis["5th"]),
+        6: str(client.app_emojis["6th"]),
+        7: str(client.app_emojis["7th"]),
+        8: str(client.app_emojis["8th"]),
+        9: str(client.app_emojis["9th"]),
+        10: str(client.app_emojis["10th"]),
     }
 
     def fmt(n):
