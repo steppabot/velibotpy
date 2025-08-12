@@ -2611,7 +2611,8 @@ class LeaderboardButton(Button):
         super().__init__(label="Leaderboard", style=discord.ButtonStyle.secondary, emoji="🏆")
 
     async def callback(self, interaction: discord.Interaction):
-        guild_id = interaction.guild.id
+        guild = interaction.guild
+        guild_id = guild.id
         tier = get_subscription_tier(guild_id)
 
         if tier not in ("premium", "elite"):
@@ -2625,7 +2626,7 @@ class LeaderboardButton(Button):
                 ephemeral=True
             )
 
-        channel_ids = tuple(c.id for c in interaction.guild.text_channels)
+        channel_ids = tuple(c.id for c in guild.text_channels)
         if not channel_ids:
             return await interaction.response.send_message(
                 embed=discord.Embed(
@@ -2636,6 +2637,7 @@ class LeaderboardButton(Button):
                 ephemeral=True
             )
 
+        # Top 10 unveilers in this guild
         with get_safe_cursor() as cur:
             cur.execute("""
                 SELECT vg.guesser_id, COUNT(*) AS unveils
@@ -2645,13 +2647,14 @@ class LeaderboardButton(Button):
                   AND vm.channel_id IN %s
                 GROUP BY vg.guesser_id
                 ORDER BY unveils DESC
-                LIMIT 20
+                LIMIT 10
             """, (channel_ids,))
             rows = cur.fetchall()
 
+        # Resolve members; filter users no longer in guild
         ranked = []
         for user_id, unveils in rows:
-            m = interaction.guild.get_member(user_id)
+            m = guild.get_member(user_id)
             if m:
                 ranked.append((m, unveils))
 
@@ -2665,14 +2668,40 @@ class LeaderboardButton(Button):
                 ephemeral=True
             )
 
-        embed = discord.Embed(title="Veil Leaderboard", color=0xeeac00)
-        embed.set_thumbnail(url="https://i.imgur.com/E2jxHuj.png")
-        medals = ["🥇", "🥈", "🥉"]
+        # Badges: 1–3 = medals, 4–10 = your custom emojis (fallback -> 🏅)
+        badge = {
+            1: "🥇",
+            2: "🥈",
+            3: "🥉",
+            4: str(client.app_emojis.get("4th", "🏅")),
+            5: str(client.app_emojis.get("5th", "🏅")),
+            6: str(client.app_emojis.get("6th", "🏅")),
+            7: str(client.app_emojis.get("7th", "🏅")),
+            8: str(client.app_emojis.get("8th", "🏅")),
+            9: str(client.app_emojis.get("9th", "🏅")),
+            10: str(client.app_emojis.get("10th", "🏅")),
+        }
 
-        for idx, (member, unveils) in enumerate(ranked[:10], start=1):
+        def fmt(n):
+            try: return f"{int(n):,}"
+            except: return str(n)
+
+        embed = discord.Embed(
+            title="Veil Leaderboard",
+            description="**Top 10 Unveilers**",
+            color=0xeeac00
+        )
+        # keep or change this to your logo
+        embed.set_thumbnail(url="https://i.imgur.com/E2jxHuj.png")
+
+        for idx, (member, unveils) in enumerate(ranked, start=1):
             name = get_display_name_safe(member).title()
-            header = f"{medals[idx-1]} {name}" if idx <= 3 else f"{idx}. {name}"
-            embed.add_field(name=header, value=f"{unveils} unveils", inline=False)
+            icon = badge.get(idx, "🏅")
+            embed.add_field(
+                name=f"{icon} {name}",
+                value=f"{fmt(unveils)} unveils",
+                inline=False
+            )
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -2983,9 +3012,10 @@ async def info(interaction: discord.Interaction):
 
 @tree.command(name="leaderboard", description="🏆 Show the top unveilers")
 async def leaderboard(interaction: discord.Interaction):
-    guild_id = interaction.guild.id
+    guild = interaction.guild
+    guild_id = guild.id
 
-    # premium/elite gate
+    # Gate to Premium/Elite
     tier = get_subscription_tier(guild_id)
     if tier not in ("premium", "elite"):
         incorrectmoji = str(client.app_emojis["veilincorrect"])
@@ -2998,8 +3028,8 @@ async def leaderboard(interaction: discord.Interaction):
             ephemeral=True
         )
 
-    # channels in this guild
-    channel_ids = tuple(c.id for c in interaction.guild.text_channels)
+    # All text channels in this guild
+    channel_ids = tuple(c.id for c in guild.text_channels)
     if not channel_ids:
         return await interaction.response.send_message(
             embed=discord.Embed(
@@ -3010,7 +3040,7 @@ async def leaderboard(interaction: discord.Interaction):
             ephemeral=True
         )
 
-    # aggregate from guesses table
+    # Top 10 unveilers
     with get_safe_cursor() as cur:
         cur.execute("""
             SELECT vg.guesser_id, COUNT(*) AS unveils
@@ -3020,14 +3050,14 @@ async def leaderboard(interaction: discord.Interaction):
               AND vm.channel_id IN %s
             GROUP BY vg.guesser_id
             ORDER BY unveils DESC
-            LIMIT 20
+            LIMIT 10
         """, (channel_ids,))
         rows = cur.fetchall()
 
-    # filter to members still in guild
+    # Resolve members that are still in the guild
     ranked = []
     for user_id, unveils in rows:
-        m = interaction.guild.get_member(user_id)
+        m = guild.get_member(user_id)
         if m:
             ranked.append((m, unveils))
 
@@ -3041,17 +3071,47 @@ async def leaderboard(interaction: discord.Interaction):
             ephemeral=True
         )
 
-    embed = discord.Embed(title="Veil Leaderboard", color=0xeeac00)
-    embed.set_thumbnail(url="https://i.imgur.com/E2jxHuj.png")
-    medals = ["🥇", "🥈", "🥉"]
+    # Badges: 1–3 medals, 4–10 your custom participation emojis (fallback 🏅)
+    badge = {
+        1: "🥇",
+        2: "🥈",
+        3: "🥉",
+        4: str(client.app_emojis.get("4th", "🏅")),
+        5: str(client.app_emojis.get("5th", "🏅")),
+        6: str(client.app_emojis.get("6th", "🏅")),
+        7: str(client.app_emojis.get("7th", "🏅")),
+        8: str(client.app_emojis.get("8th", "🏅")),
+        9: str(client.app_emojis.get("9th", "🏅")),
+        10: str(client.app_emojis.get("10th", "🏅")),
+    }
 
-    for idx, (member, unveils) in enumerate(ranked[:10], start=1):
+    def fmt(n):
+        try: return f"{int(n):,}"
+        except: return str(n)
+
+    embed = discord.Embed(
+        title="Veil Leaderboard",
+        description="**Top 10 Unveilers**",
+        color=0xeeac00
+    )
+    # Use server icon if available
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    else:
+        embed.set_thumbnail(url="https://i.imgur.com/E2jxHuj.png")
+
+    for idx, (member, unveils) in enumerate(ranked, start=1):
         name = get_display_name_safe(member).title()
-        header = f"{medals[idx-1]} {name}" if idx <= 3 else f"{idx}. {name}"
-        embed.add_field(name=header, value=f"{unveils} unveils", inline=False)
+        icon = badge.get(idx, "🏅")
+        embed.add_field(
+            name=f"{icon} {name}",
+            value=f"{fmt(unveils)} unveils",
+            inline=False
+        )
 
+    # Public message (change to ephemeral=True if you prefer)
     await interaction.response.send_message(embed=embed)
-
+    
 @tree.command(name="user", description="👤 Check Veil User Stats")
 @app_commands.describe(user="The user to check (optional)")
 async def user_stats(interaction: discord.Interaction, user: discord.Member = None):
