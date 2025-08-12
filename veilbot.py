@@ -2680,7 +2680,9 @@ class LeaderboardButton(Button):
 
         # Badges: 1–3 = medals, 4–10 = your custom emojis (fallback -> 🏅)
         badge = {
-            1: "🥇", 2: "🥈", 3: "🥉",
+            1: str(client.app_emojis["1st"])
+            2: str(client.app_emojis["2nd"]),
+            3: str(client.app_emojis["3rd"]),
             4: str(client.app_emojis["4th"]),
             5: str(client.app_emojis["5th"]),
             6: str(client.app_emojis["6th"]),
@@ -3082,7 +3084,9 @@ async def leaderboard(interaction: discord.Interaction):
 
     # Badges: 1–3 medals, 4–10 your custom participation emojis (fallback 🏅)
     badge = {
-        1: "🥇", 2: "🥈", 3: "🥉",
+        1: str(client.app_emojis["1st"]),
+        2: str(client.app_emojis["2nd"]), 
+        3: str(client.app_emojis["3rd"]),
         4: str(client.app_emojis["4th"]),
         5: str(client.app_emojis["5th"]),
         6: str(client.app_emojis["6th"]),
