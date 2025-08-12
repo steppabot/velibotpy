@@ -261,7 +261,13 @@ async def on_ready():
 SUPPORT_SERVER_ID = 1394932709394087946  # Your support server ID
 SUPPORT_CHANNEL_ID = 1399973286649008158  # The channel where webhook posts
 DISCORD_API_BASE = "https://discord.com/api/v10"
-
+UPGRADE_RE = re.compile(
+    r"guild\s+(\d+)\s+upgraded\s+to\s+\*{0,2}([A-Za-z]+)\*{0,2}\s+tier!?",
+    re.IGNORECASE,
+)
+COIN_RE = re.compile(
+    r"^\[COIN_TOPUP\]\s+session_id=(\S+)\s+user_id=(\d+)\s+guild_id=(\d+)\s+coins=(\d+)\s*$"
+)
 
 emoji_patternz = re.compile(r"<a?:([a-zA-Z0-9_]+):(\d+)>")  # matches <:name:id> and <a:name:id>
 emoji_sequence_pattern = regex.compile(r'\X', regex.UNICODE)
@@ -3399,137 +3405,134 @@ async def shards_cmd(inter: discord.Interaction):
 
 @client.event
 async def on_message(message: discord.Message):
-    # ---- Diagnostics so we can see what's happening ----
-    try:
-        preview = (message.content or "")[:120].replace("\n", " ")
-    except Exception:
-        preview = "<no content>"
-
-    # Only react to posts from your webhook in the support channel
-    if not message.webhook_id:
-        # If you still use prefix commands, uncomment the next line:
-        # await client.process_commands(message)
+    # Only parse the single relay channel
+    if message.channel.id != SUPPORT_CHANNEL_ID:
         return
 
-    if message.channel.id != SUPPORT_CHANNEL_ID:
-        # This is the #1 reason the handler seems to 'do nothing'
+    # Accept messages from your webhook OR from your own bot user
+    is_from_webhook = bool(message.webhook_id)
+    is_from_me      = message.author and client.user and message.author.id == client.user.id
+    if not (is_from_webhook or is_from_me):
         return
 
     txt = (message.content or "").strip()
+    if not txt:
+        return
 
-    # --- 1) Guild tier upgrade ---
-    m_up = re.match(r"^🎉 Guild (\d+) upgraded to \*\*(\w+)\*\* tier!\s*$", txt)
+    # --- A) COIN TOP-UP ------------------------------------------------------
+    m_coin = COIN_RE.match(txt)
+    if m_coin:
+        session_id = m_coin.group(1)
+        user_id    = int(m_coin.group(2))
+        guild_id   = int(m_coin.group(3))
+        coins      = int(m_coin.group(4))
+
+        # look up the stored interaction info (as you already do)
+        with get_safe_cursor() as cur:
+            cur.execute("""
+                SELECT interaction_token, application_id, user_id, guild_id, coins
+                FROM coin_checkout_sessions
+                WHERE stripe_session_id = %s
+            """, (session_id,))
+            row = cur.fetchone()
+
+        if not row:
+            print(f"[coin] no session {session_id} found; ignoring")
+            return
+
+        interaction_token, application_id, u_saved, g_saved, coins_saved = row
+        if u_saved != user_id or g_saved != guild_id:
+            print(f"[coin] id mismatch for {session_id}; ignoring")
+            return
+        # ... after verifying row matches ...
+        new_balance = get_user_coins(user_id, guild_id) or 0
+        veilcoinemoji = str(client.app_emojis.get("veilcoin", "🪙"))
+        
+        # format numbers
+        coins_str = fmt(coins_saved)
+        bal_str   = fmt(new_balance)
+        
+        payload = {
+            "embeds": [{
+                "title": f"{veilcoinemoji} +{coins_str} Veil Coins Added",
+                "description": f"Thanks for your support! Your new balance is **{bal_str}**.",
+                "color": 0xeeac00,
+                "fields": [
+                    {"name": "Amount",  "value": f"{veilcoinemoji} `{coins_str}`", "inline": True},
+                    {"name": "Balance", "value": f"`{bal_str}`",                   "inline": True},
+                ],
+                "footer": {"text": "Tip: use /user any time to see your balance."}
+            }],
+            "components": []
+        }
+
+        url = f"{DISCORD_API_BASE}/webhooks/{int(application_id)}/{interaction_token}/messages/@original"
+        try:
+            r = requests.patch(url, json=payload, timeout=6)
+            print(f"[coin] PATCH @original -> {r.status_code} {r.text[:150]}")
+        except Exception as e:
+            print(f"[coin] PATCH failed: {e}")
+
+        # Clean up relay post
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        return
+
+    # --- B) GUILD UPGRADE ----------------------------------------------------
+    m_up = UPGRADE_RE.search(txt)
     if m_up:
         guild_id = int(m_up.group(1))
-        tier = m_up.group(2).lower()
+        tier     = m_up.group(2).lower()  # "basic"|"premium"|"elite"
 
         guild = client.get_guild(guild_id)
         if not guild:
+            print(f"[upgrade] guild {guild_id} not in cache")
             return
 
-        # Get configured veil channel
         with get_safe_cursor() as cur:
-            cur.execute("SELECT channel_id FROM veil_channels WHERE guild_id = %s", (guild_id,))
+            cur.execute("SELECT channel_id FROM veil_channels WHERE guild_id=%s", (guild_id,))
             row = cur.fetchone()
-        channel_id = row[0] if row else None
-        if not channel_id:
+        if not row:
+            print(f"[upgrade] no configured veil channel for guild {guild_id}")
             return
 
-        channel = guild.get_channel(channel_id)
+        channel_id = row[0]
+        channel = guild.get_channel(channel_id) or client.get_channel(channel_id)
         if not channel or not channel.permissions_for(guild.me).send_messages:
+            print(f"[upgrade] cannot send in channel {channel_id} (guild {guild_id})")
             return
-
-        maskemoji = str(next((e for e in client.emojis if e.name == "veilemoji"), "🎭"))
-        veilcoinemoji = str(next((e for e in client.emojis if e.name == "veilcoin"), "🪙"))
 
         tiers_display = {"basic": "Basic 🌟", "premium": "Premium 💎", "elite": "Elite 🧠"}
-        perks = {
-            "basic":   [f"{veilcoinemoji} • **250** coins per month", "🔄 • Refills every month", "🔍 • Earning coins by unveiling"],
-            "premium": [f"{veilcoinemoji} • **1,000** coins per month", "🔄 • Refills every month", "🔍 • Earning coins by unveiling", "🥇 • Unveiling leaderboard"],
-            "elite":   [f"{veilcoinemoji} • Unlimited coins for all users", "🗃️ • Admin-only logging access", "🥇 • Unveiling leaderboard", "💎 • Early access to new features"],
-        }
-
         if tier not in tiers_display:
+            print(f"[upgrade] unknown tier {tier} for guild {guild_id}")
             return
+
+        veilcoinemoji = str(client.app_emojis.get("veilcoin", "🪙"))
+        perks = {
+            "basic":   [f"{veilcoinemoji} • **250** coins/mo",   "🔄 • Monthly refills", "🔍 • Earn by unveiling"],
+            "premium": [f"{veilcoinemoji} • **1,000** coins/mo", "🔄 • Monthly refills", "🔍 • Earn by unveiling", "🥇 • Leaderboard"],
+            "elite":   [f"{veilcoinemoji} • Unlimited coins",    "🗃️ • Admin logs",      "🥇 • Leaderboard",       "💎 • Early features"],
+        }
 
         embed = discord.Embed(
             title=f"🎉 {guild.name} Upgraded!",
-            description=(
-                f"This server has been upgraded to the **{tiers_display[tier]}** tier!\n\n"
-                f"Thank you for supporting **Veil**!\n\n"
-                "Your members now get:\n" + "\n".join(perks[tier])
-            ),
+            description=f"This server has been upgraded to **{tiers_display[tier]}**.\n\nYour members now get:\n" + "\n".join(perks[tier]),
             color=0xeeac00
         )
-        embed.set_footer(text="VeilBot • Every message wears a mask", icon_url=guild.icon.url if guild.icon else None)
+        if guild.icon:
+            embed.set_footer(text="VeilBot • Every message wears a mask", icon_url=guild.icon.url)
+        else:
+            embed.set_footer(text="VeilBot • Every message wears a mask")
 
         view = AdminLog() if tier == "elite" else None
-
         try:
             await channel.send(embed=embed, view=view)
-            print(f"✅ Upgrade embed sent to {guild.name} ({guild_id}) with tier {tier}")
+            print(f"✅ upgrade embed sent to {guild.name} ({guild_id}) tier={tier}")
         except Exception as e:
-            print(f"❌ Failed to send upgrade message in {guild.name}: {e}")
-        return  # done with upgrade branch
-
-    # --- 2) Coin top-up from webhook ---
-    m_coin = re.match(r"^\[COIN_TOPUP\]\s+session_id=(\S+)\s+user_id=(\d+)\s+guild_id=(\d+)\s+coins=(\d+)\s*$", txt)
-    if not m_coin:
+            print(f"❌ failed to send upgrade embed in {guild.name}: {e}")
         return
-
-    session_id = m_coin.group(1)
-    user_id = int(m_coin.group(2))
-    guild_id = int(m_coin.group(3))
-    coins = int(m_coin.group(4))
-
-    with get_safe_cursor() as cur:
-        cur.execute("""
-            SELECT interaction_token, application_id, user_id, guild_id, coins
-            FROM coin_checkout_sessions
-            WHERE stripe_session_id = %s
-        """, (session_id,))
-        row = cur.fetchone()
-
-    if not row:
-        return
-
-    interaction_token, application_id, u_saved, g_saved, coins_saved = row
-    if u_saved != user_id or g_saved != guild_id:
-        return
-
-    # Build success embed (gold), include new balance
-    new_balance = get_user_coins(u_saved, g_saved) or 0
-    coins_str = fmt(coins_saved)
-    bal_str   = fmt(new_balance)
-    veilcoinemoji = str(client.app_emojis.get("veilcoin", "🪙"))
-
-    payload = {
-        "embeds": [{
-            "title": f"{veilcoinemoji} +{coins_str} Veil Coins Added",
-            "description": f"Thanks for your support! Your new balance is **{bal_str}**.",
-            "color": 0xeeac00,  # gold
-            "fields": [
-                {"name": "Amount",  "value": f"{veilcoinemoji} `{coins_str}`", "inline": True},
-                {"name": "Balance", "value": f"`{bal_str}`",                  "inline": True},
-            ],
-            "footer": {"text": "Tip: use /user any time to see your balance."}
-        }],
-        "components": []  # remove any old buttons
-    }
-
-    # PATCH the same ephemeral (must be the ORIGINAL response of that interaction)
-    url = f"{DISCORD_API_BASE}/webhooks/{int(application_id)}/{interaction_token}/messages/@original"
-    try:
-        r = requests.patch(url, json=payload, timeout=6)
-        print(f"[relay] PATCH @original -> {r.status_code} {r.text[:200]}")
-    except Exception as e:
-        print(f"[relay] ❌ PATCH @original failed: {e}")
-
-    # Clean up the relay post
-    try:
-        await message.delete()
-    except Exception as e:
-        print(f"[relay] (non-fatal) delete failed: {e}")
 
 if __name__ == "__main__":
     init_db()  # ✅ just to ensure veil_subscriptions exists before on_guild_join runs
