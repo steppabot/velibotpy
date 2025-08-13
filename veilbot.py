@@ -268,7 +268,7 @@ async def on_ready():
 
 
 
-
+OWNER_IDS = {568583831985061918}  # <-- your Discord user ID(s)
 SUPPORT_SERVER_ID = 1394932709394087946  # Your support server ID
 SUPPORT_CHANNEL_ID = 1399973286649008158  # The channel where webhook posts
 DISCORD_API_BASE = "https://discord.com/api/v10"
@@ -3457,6 +3457,56 @@ async def remove_veil_error(interaction: discord.Interaction, error):
                 description="You must be an **administrator** to use this command.",
                 color=0x992d22
             ),
+            ephemeral=True
+        )
+
+@tree.command(name="guilds", description="(Owner) List all guilds the bot is in")
+async def guilds_cmd(inter: discord.Interaction):
+    # Owner gate (safer than admin-gating since this reveals other servers)
+    if inter.user.id not in OWNER_IDS:
+        incorrectmoji = str(client.app_emojis.get("veilincorrect", "❌"))
+        return await inter.response.send_message(
+            embed=discord.Embed(
+                title=f"{incorrectmoji} Owner Only",
+                description="This command is restricted.",
+                color=0x992d22
+            ),
+            ephemeral=True
+        )
+
+    # Collect & sort guilds (by member count desc, fallback to 0)
+    guilds = sorted(client.guilds, key=lambda g: (g.member_count or 0), reverse=True)
+
+    # Build lines
+    def fmt(n):
+        try: return f"{int(n):,}"
+        except: return str(n)
+
+    lines = [
+        f"{idx:>2}. {g.name} — `{g.id}` ({fmt(getattr(g, 'member_count', 0) or 0)} members)"
+        for idx, g in enumerate(guilds, start=1)
+    ]
+
+    # First chunk fits under Discord 2000-char message limit (keep some headroom)
+    out, total = [], 0
+    for line in lines:
+        if total + len(line) + 1 > 1900:
+            break
+        out.append(line)
+        total += len(line) + 1
+
+    header = f"**Guilds:** {len(guilds)}"
+    body = "```" + ("\n".join(out) if out else "No guilds") + "```"
+    await inter.response.send_message(f"{header}\n{body}", ephemeral=True)
+
+    # If truncated, also send a full text file as an ephemeral follow-up
+    if len(out) < len(lines):
+        import io
+        full_text = "\n".join(lines)
+        buf = io.BytesIO(full_text.encode("utf-8"))
+        await inter.followup.send(
+            content="(Full list attached as a file)",
+            file=discord.File(buf, filename="guilds.txt"),
             ephemeral=True
         )
 
