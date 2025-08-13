@@ -1084,33 +1084,71 @@ def build_user_stats_embed(guild: discord.Guild, user: discord.Member) -> discor
     user_id = user.id
     guild_id = guild.id
 
+    # Ensure row exists + perform monthly refill if due
     ensure_user_entry(user_id, guild_id)
     refill_user_coins(user_id, guild_id)
 
-    tier  = get_subscription_tier(guild_id) or "free"
+    tier = (get_subscription_tier(guild_id) or "free").lower()
     coins = get_user_coins(user_id, guild_id) or 0
 
-    # pull the cached unveil count (FAST)
+    # Pull cached unveil count + last_refill (FAST)
     with get_safe_cursor() as cur:
         cur.execute("""
-            SELECT veils_unveiled FROM veil_users
+            SELECT veils_unveiled, last_refill
+            FROM veil_users
             WHERE user_id=%s AND guild_id=%s
         """, (user_id, guild_id))
         row = cur.fetchone()
-    unveiled_count = (row[0] if row else 0) or 0
 
-    veilcoin = str(client.app_emojis["veilcoin"])
-    maskemoji = str(client.app_emojis["veilemoji"])
+    unveiled_count = (row[0] if row else 0) or 0
+    last_refill    = row[1] if row else None  # TIMESTAMPTZ or None
+
+    # Monthly refill amounts by tier
+    REFILL_BY_TIER = {
+        "free":    100,
+        "basic":   250,
+        "premium": 1000,
+        "elite":   None,  # unlimited
+    }
+    refill_amt = REFILL_BY_TIER.get(tier)
+
+    # Compute next refill as +30d from last_refill (for tiers with refills)
+    if refill_amt is not None and last_refill:
+        # Ensure tz-aware UTC
+        if last_refill.tzinfo is None:
+            last_refill = last_refill.replace(tzinfo=timezone.utc)
+        next_refill_dt = last_refill + timedelta(days=30)
+        ts = int(next_refill_dt.timestamp())  # UNIX seconds
+        # short date + relative
+        next_refill_display = f"<t:{ts}:d>"
+    else:
+        next_refill_display = "—" if tier != "elite" else "N/A"
+
+    # Pretty bits
+    veilcoin  = str(client.app_emojis.get("veilcoin", "🪙"))
+    maskemoji = str(client.app_emojis.get("veilemoji", "🎭"))
     pfp = user.display_avatar.url
     username = get_display_name_safe(user).capitalize()
 
     coins_display    = "♾️" if tier == "elite" else f"{int(coins):,}"
     unveiled_display = f"{int(unveiled_count):,}"
+    monthly_refill_display = "♾️ Unlimited" if tier == "elite" else f"{(refill_amt or 0):,} / month"
 
     embed = discord.Embed(title=f"{username}'s Veil Stats", color=0xeeac00)
     embed.set_thumbnail(url=pfp)
+
+    # Row 1
     embed.add_field(name="Veil Coins",    value=f"{veilcoin} `{coins_display}`",     inline=True)
     embed.add_field(name="Msgs Unveiled", value=f"{maskemoji} `{unveiled_display}`", inline=True)
+
+    # Row 2
+    embed.add_field(name="Monthly Refill", value=f"`{monthly_refill_display}`", inline=True)
+    # Keep time tags unquoted so Discord renders them; quote placeholders only
+    if next_refill_display in ("—", "N/A"):
+        embed.add_field(name="Next Refill", value=f"`{next_refill_display}`", inline=True)
+    else:
+        embed.add_field(name="Next Refill", value=next_refill_display, inline=True)
+
     return embed
 
 def build_help_embed(guild: discord.Guild):
