@@ -1904,13 +1904,17 @@ class UnveilDropdown(discord.ui.Select):
             return
 
 class UnveilView(discord.ui.View):
-    def __init__(self, message_id, author_id, interaction):
+    def __init__(self, message_id: int, author_id: int, interaction: discord.Interaction):
         super().__init__(timeout=None)
 
         guild = interaction.guild
+        channel_id = interaction.channel.id
+
+        # --- Build candidate pools ---
+        # Everyone except bots & the real author
         all_members = [m for m in guild.members if not m.bot and m.id != author_id]
 
-        # Start with recent posters
+        # Recent posters in THIS channel (ids only -> members)
         with get_safe_cursor() as cur:
             cur.execute("""
                 SELECT author_id
@@ -1918,44 +1922,64 @@ class UnveilView(discord.ui.View):
                 WHERE channel_id = %s
                 GROUP BY author_id
                 ORDER BY MAX(timestamp) DESC
-                LIMIT 24
-            """, (interaction.channel.id,))
+                LIMIT 50
+            """, (channel_id,))
             recent_ids = [row[0] for row in cur.fetchall() if row[0] != author_id]
 
-        # Convert to member objects
         recent_members = [guild.get_member(uid) for uid in recent_ids]
         recent_members = [m for m in recent_members if m and not m.bot and m.id != author_id]
 
-        # Fill the rest with random members
+        # --- Random selection logic ---
         import random
-        remaining_spots = 24 - len(recent_members)
-        random.shuffle(all_members)
-        filler_members = all_members[:remaining_spots]
 
-        # Add the real author
+        # Cap how many we *try* to take from "recent" to keep variety
+        RECENT_CAP = 12
+        take_recent = min(RECENT_CAP, len(recent_members))
+        recent_pick = random.sample(recent_members, k=take_recent) if take_recent else []
+
+        # Fill the rest from everyone else (excluding the ones we already took)
+        remaining_slots = max(0, 24 - len(recent_pick))  # 24 + author = 25 max
+        excluded_ids = {m.id for m in recent_pick}
+        others_pool = [m for m in all_members if m.id not in excluded_ids]
+
+        if remaining_slots and others_pool:
+            others_pick = random.sample(others_pool, k=min(remaining_slots, len(others_pool)))
+        else:
+            others_pick = []
+
+        # Combine + guarantee the real author is present
+        final_members = recent_pick + others_pick
         author_member = guild.get_member(author_id)
-        final_members = recent_members + filler_members
-        if author_member:
+        if author_member and not author_member.bot:
+            # If we somehow ran out of space, bump one random entry to ensure author presence
+            if len(final_members) >= 24:
+                final_members.pop(random.randrange(len(final_members)))
             final_members.append(author_member)
 
-        # De-dupe and trim to 25
+        # De-dupe just in case, then hard-cap to 25
         seen = set()
         unique_members = []
         for m in final_members:
-            if m.id not in seen:
-                seen.add(m.id)
-                unique_members.append(m)
+            if m.id in seen:
+                continue
+            seen.add(m.id)
+            unique_members.append(m)
             if len(unique_members) >= 25:
                 break
 
-        # Sort alphabetically
-        unique_members.sort(key=lambda m: m.display_name.lower())
+        # Shuffle so the order is NOT alphabetical and the author position is random too
+        random.shuffle(unique_members)
 
+        # Build menu options
         options = [
-            discord.SelectOption(label=get_display_name_safe(member), value=str(member.id))
+            discord.SelectOption(
+                label=get_display_name_safe(member),
+                value=str(member.id)
+            )
             for member in unique_members
         ]
 
+        # Attach the dropdown
         self.add_item(UnveilDropdown(message_id, author_id, options))
 
 class CreateChannelButton(Button):
