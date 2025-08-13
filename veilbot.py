@@ -3106,10 +3106,7 @@ async def leaderboard(interaction: discord.Interaction):
         color=0xeeac00
     )
     # Use server icon if available
-    if guild.icon:
-        embed.set_thumbnail(url=guild.icon.url)
-    else:
-        embed.set_thumbnail(url="https://i.imgur.com/E2jxHuj.png")
+    embed.set_thumbnail(url="https://i.imgur.com/E2jxHuj.png")
 
     for idx, (member, unveils) in enumerate(ranked, start=1):
         name = get_display_name_safe(member).title()
