@@ -1140,7 +1140,7 @@ def build_user_stats_embed(guild: discord.Guild, user: discord.Member) -> discor
     # Row 1
     embed.add_field(name="Veil Coins",    value=f"{veilcoin} `{coins_display}`",     inline=True)
     embed.add_field(name="Msgs Unveiled", value=f"{maskemoji} `{unveiled_display}`", inline=True)
-
+    embed.add_field(name="\u200b", value="\u200b", inline=True)
     # Row 2
     embed.add_field(name="Monthly Refill", value=f"`{monthly_refill_display}`", inline=True)
     # Keep time tags unquoted so Discord renders them; quote placeholders only
