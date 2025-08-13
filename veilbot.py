@@ -4,6 +4,7 @@ from discord.ui import Modal, TextInput, Button, View, Select
 from discord.app_commands import AppCommandError, CheckFailure
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps, ImageChops
 from datetime import datetime, timedelta, timezone
+from collections import Counter
 from dotenv import load_dotenv
 from psycopg2 import sql
 from copy import deepcopy
@@ -3459,17 +3460,53 @@ async def remove_veil_error(interaction: discord.Interaction, error):
             ephemeral=True
         )
 
+# ---- admin-only shards command ----
 @tree.command(name="shards", description="Show shard status")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)  # hides from non-admins in the picker
 async def shards_cmd(inter: discord.Interaction):
+    # Runtime guard (in case permissions changed or default perms overridden)
+    if not inter.user.guild_permissions.administrator:
+        incorrectmoji = str(client.app_emojis.get("veilincorrect", "⚠️"))
+        return await inter.response.send_message(
+            embed=discord.Embed(
+                title=f"{incorrectmoji} Admin Only",
+                description="You must be a server admin to use this command.",
+                color=0x992d22
+            ),
+            ephemeral=True
+        )
+
+    # Shard latencies
     rows = []
-    for sid, info in sorted(client.shards.items()):
-        ms = int(info.latency * 1000)
+    shard_info = getattr(client, "shards", {}) or {}
+    # Guilds per shard
+    per_shard_counts = Counter(g.shard_id for g in client.guilds)
+    total_guilds = len(client.guilds)
+
+    if shard_info:
+        for sid, info in sorted(shard_info.items()):
+            ms = int((getattr(info, "latency", client.latency) or 0) * 1000)
+            dot = "🟢" if ms < 250 else ("🟡" if ms < 600 else "🔴")
+            gcount = per_shard_counts.get(sid, 0)
+            rows.append(f"{sid:>2}: {dot} {ms} ms • {gcount} guilds")
+        shard_count = client.shard_count or len(shard_info)
+    else:
+        # Unsharded fallback
+        ms = int(client.latency * 1000)
         dot = "🟢" if ms < 250 else ("🟡" if ms < 600 else "🔴")
-        rows.append(f"{sid:>2}: {dot} {ms} ms")
-    await inter.response.send_message(
-        f"**Shards:** {client.shard_count}\n```" + "\n".join(rows) + "```",
-        ephemeral=True
+        rows.append(f" 0: {dot} {ms} ms • {total_guilds} guilds")
+        shard_count = 1
+
+    header = (
+        f"**Shards:** {shard_count}\n"
+        f"**Total Guilds:** {total_guilds:,}\n"
+        "```"
+        + ("\n".join(rows) if rows else "no shard data")
+        + "```"
     )
+
+    await inter.response.send_message(header, ephemeral=True)
 
 @client.event
 async def on_message(message: discord.Message):
