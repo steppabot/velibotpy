@@ -2720,7 +2720,7 @@ class LeaderboardButton(Button):
                   AND vm.channel_id IN %s
                 GROUP BY vg.guesser_id
                 ORDER BY unveils DESC
-                LIMIT 10
+                LIMIT 50
             """, (channel_ids,))
             rows = cur.fetchall()
 
@@ -3124,7 +3124,7 @@ async def leaderboard(interaction: discord.Interaction):
               AND vm.channel_id IN %s
             GROUP BY vg.guesser_id
             ORDER BY unveils DESC
-            LIMIT 10
+            LIMIT 50
         """, (channel_ids,))
         rows = cur.fetchall()
 
