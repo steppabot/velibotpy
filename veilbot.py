@@ -2731,6 +2731,8 @@ class LeaderboardButton(Button):
             if m:
                 ranked.append((m, unveils))
 
+        ranked = ranked[:10]
+
         if not ranked:
             return await interaction.response.send_message(
                 embed=discord.Embed(
@@ -3134,6 +3136,10 @@ async def leaderboard(interaction: discord.Interaction):
         m = guild.get_member(user_id)
         if m:
             ranked.append((m, unveils))
+
+            
+    ranked = ranked[:10]
+
 
     if not ranked:
         return await interaction.response.send_message(
