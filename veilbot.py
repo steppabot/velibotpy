@@ -1007,6 +1007,24 @@ async def notify_failed_payments():
 
         await asyncio.sleep(900)  # every 15 minutes
 
+def count_incorrect_guesses_for_guild(guesser_id: int, guild: discord.Guild) -> int:
+    """# of incorrect guesses this user made in THIS guild."""
+    channel_ids = tuple(c.id for c in guild.text_channels)
+    if not channel_ids:
+        return 0
+
+    with get_safe_cursor() as cur:
+        cur.execute("""
+            SELECT COUNT(*)
+            FROM veil_guesses g
+            JOIN veil_messages m ON m.message_id = g.message_id
+            WHERE g.guesser_id = %s
+              AND g.is_correct = FALSE
+              AND m.channel_id IN %s
+        """, (guesser_id, channel_ids))
+        row = cur.fetchone()
+    return int(row[0]) if row else 0
+
 async def build_bot_info_embed(guild: discord.Guild, tier: str = "free") -> tuple[discord.Embed, Optional[View]]:   
     bot_user = guild.me
     joined_at = bot_user.joined_at.strftime("%B %d, %Y") if bot_user.joined_at else "Unknown"
@@ -1080,7 +1098,7 @@ def build_store_embed() -> discord.Embed:
     embed.set_thumbnail(url="attachment://veilstore.png")
     return embed
 
-def build_user_stats_embed(guild: discord.Guild, user: discord.Member) -> discord.Embed:
+def build_user_stats_embed_and_file(guild: discord.Guild, user: discord.Member) -> tuple[discord.Embed, discord.File | None]:
     user_id = user.id
     guild_id = guild.id
 
@@ -1103,6 +1121,9 @@ def build_user_stats_embed(guild: discord.Guild, user: discord.Member) -> discor
     unveiled_count = (row[0] if row else 0) or 0
     last_refill    = row[1] if row else None  # TIMESTAMPTZ or None
 
+    # Incorrect guesses (scoped to this guild via channel_id)
+    incorrect_count = count_incorrect_guesses_for_guild(user_id, guild)
+
     # Monthly refill amounts by tier
     REFILL_BY_TIER = {
         "free":    100,
@@ -1114,42 +1135,54 @@ def build_user_stats_embed(guild: discord.Guild, user: discord.Member) -> discor
 
     # Compute next refill as +30d from last_refill (for tiers with refills)
     if refill_amt is not None and last_refill:
-        # Ensure tz-aware UTC
         if last_refill.tzinfo is None:
             last_refill = last_refill.replace(tzinfo=timezone.utc)
         next_refill_dt = last_refill + timedelta(days=30)
-        ts = int(next_refill_dt.timestamp())  # UNIX seconds
-        # short date + relative
+        ts = int(next_refill_dt.timestamp())
         next_refill_display = f"<t:{ts}:d>"
     else:
         next_refill_display = "—" if tier != "elite" else "N/A"
 
     # Pretty bits
-    veilcoin  = str(client.app_emojis.get("veilcoin", "🪙"))
-    maskemoji = str(client.app_emojis.get("veilemoji", "🎭"))
+    veilcoin  = str(getattr(client, "app_emojis", {}).get("veilcoin", "🪙"))
+    maskemoji = str(getattr(client, "app_emojis", {}).get("veilemoji", "🎭"))
+    incorrectmoji = str(client.app_emojis["veilincorrect"])
     pfp = user.display_avatar.url
     username = get_display_name_safe(user).capitalize()
 
-    coins_display    = "♾️" if tier == "elite" else f"{int(coins):,}"
-    unveiled_display = f"{int(unveiled_count):,}"
-    monthly_refill_display = "♾️ Unlimited" if tier == "elite" else f"{(refill_amt or 0):,} / month"
+    coins_display            = "♾️" if tier == "elite" else f"{int(coins):,}"
+    unveiled_display         = f"{int(unveiled_count):,}"
+    incorrect_display        = f"{int(incorrect_count):,}"
+    monthly_refill_display   = "♾️ Unlimited" if tier == "elite" else f"{(refill_amt or 0):,} / month"
 
+    # === embed layout (matches your demo) ===
     embed = discord.Embed(title=f"{username}'s Veil Stats", color=0xeeac00)
     embed.set_thumbnail(url=pfp)
 
-    # Row 1
-    embed.add_field(name="Veil Coins",    value=f"{veilcoin} `{coins_display}`",     inline=True)
-    embed.add_field(name="Msgs Unveiled", value=f"{maskemoji} `{unveiled_display}`", inline=True)
-    embed.add_field(name="\u200b", value="\u200b", inline=True)
-    # Row 2
+    # Row 1: Veil Coins + spacers
+    embed.add_field(name="Veil Coins", value=f"{veilcoin} `{coins_display}`", inline=True)
+    embed.add_field(name=ZWS, value=ZWS, inline=True)
+    embed.add_field(name=ZWS, value=ZWS, inline=True)
+
+    # Row 2: Monthly Refill, Next Refill, spacer
     embed.add_field(name="Monthly Refill", value=f"`{monthly_refill_display}`", inline=True)
-    # Keep time tags unquoted so Discord renders them; quote placeholders only
     if next_refill_display in ("—", "N/A"):
         embed.add_field(name="Next Refill", value=f"`{next_refill_display}`", inline=True)
     else:
         embed.add_field(name="Next Refill", value=next_refill_display, inline=True)
+    embed.add_field(name=ZWS, value=ZWS, inline=True)
 
-    return embed
+    # Row 3: Msgs Unveiled, Incorrect Guesses, spacer
+    embed.add_field(name="Msgs Unveiled", value=f"{maskemoji} `{unveiled_display}`", inline=True)
+    embed.add_field(name="Incorrect Guesses", value=f"{incorrectmoji} `{incorrect_display}`", inline=True)
+    embed.add_field(name=ZWS, value=ZWS, inline=True)
+
+    # Accuracy header + bar image
+    embed.add_field(name="Accuracy", value="", inline=False)
+    file = make_accuracy_bar_image(correct=unveiled_count, incorrect=incorrect_count)
+    embed.set_image(url="attachment://accuracy.png")
+
+    return embed, file
 
 def build_help_embed(guild: discord.Guild):
     tier = get_subscription_tier(guild.id) or "free"
@@ -2639,7 +2672,7 @@ class MyStatsButton(Button):
         super().__init__(label="My Stats", style=discord.ButtonStyle.secondary, emoji="👤")
 
     async def callback(self, interaction: discord.Interaction):
-        embed = build_user_stats_embed(interaction.guild, interaction.user)
+        embed = build_user_stats_embed_and_file(interaction.guild, interaction.user)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 class HelpUpgradeButton(Button):
@@ -3193,7 +3226,7 @@ async def leaderboard(interaction: discord.Interaction):
 @app_commands.describe(user="The user to check (optional)")
 async def user_stats(interaction: discord.Interaction, user: discord.Member = None):
     target = user or interaction.user
-    embed = build_user_stats_embed(interaction.guild, target)
+    embed = build_user_stats_embed_and_file(interaction.guild, target)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @tree.command(name="veil", description="💬 Send a Message Behind a Veil")
