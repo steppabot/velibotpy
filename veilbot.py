@@ -198,6 +198,8 @@ def init_db():
         print(f"Database error: {e}")
         return None, None
 
+ZWS = "\u200B"
+
 APPLICATION_EMOJIS = {
     "veilsuccess": 1403948454589235201,
     "veilcaution": 1403948435895488592,
