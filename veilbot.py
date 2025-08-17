@@ -1100,6 +1100,55 @@ def build_store_embed() -> discord.Embed:
     embed.set_thumbnail(url="attachment://veilstore.png")
     return embed
 
+def make_accuracy_bar_image(
+    correct: int,
+    incorrect: int,
+    *,
+    width: int = 180,
+    height: int = 16,
+    pad: int = 0,
+    bar_h: int = 16,
+    top: int = 0,
+    fill: str = "#e5a41a",
+    # semi-neutral outline that works on light & dark; RGBA allowed
+    border=(168, 168, 168, 200),
+    border_w: int = 2,
+):
+    total = max(correct + incorrect, 1)
+    pct = correct / total
+
+    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+
+    x0, y0 = pad, top
+    x1, y1 = width - pad, y0 + bar_h
+    radius = max(4, bar_h // 2)
+
+    # Transparent track: outline only (no fill)
+    d.rounded_rectangle(
+        (x0, y0, x1, y1),
+        radius=radius,
+        fill=None,
+        outline=border,
+        width=border_w
+    )
+
+    # Filled portion
+    fill_w = int((x1 - x0) * pct)
+    if fill_w > 0:
+        # When very short, shrink radius to avoid weird corners
+        fill_radius = min(radius, max(1, min(fill_w // 2, bar_h // 2)))
+        d.rounded_rectangle(
+            (x0, y0, x0 + fill_w, y1),
+            radius=fill_radius,
+            fill=fill
+        )
+
+    bio = BytesIO()
+    img.save(bio, "PNG")
+    bio.seek(0)
+    return discord.File(bio, filename="accuracy.png")
+
 def build_user_stats_embed_and_file(guild: discord.Guild, user: discord.Member) -> tuple[discord.Embed, discord.File | None]:
     user_id = user.id
     guild_id = guild.id
