@@ -2724,7 +2724,7 @@ class MyStatsButton(Button):
 
     async def callback(self, interaction: discord.Interaction):
         embed, file = build_user_stats_embed_and_file(interaction.guild, interaction.user)
-        await interaction.response.send_message(embed=embed, file=file, ephemeral=ephemeral)
+        await interaction.response.send_message(embed=embed, file=file, ephemeral=True)
 
 class HelpUpgradeButton(Button):
     def __init__(self):
