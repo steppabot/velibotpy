@@ -2723,8 +2723,8 @@ class MyStatsButton(Button):
         super().__init__(label="My Stats", style=discord.ButtonStyle.secondary, emoji="👤")
 
     async def callback(self, interaction: discord.Interaction):
-        embed = build_user_stats_embed_and_file(interaction.guild, interaction.user)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        embed, file = build_user_stats_embed_and_file(interaction.guild, interaction.user)
+        await interaction.response.send_message(embed=embed, file=file, ephemeral=ephemeral)
 
 class HelpUpgradeButton(Button):
     def __init__(self):
@@ -3275,10 +3275,16 @@ async def leaderboard(interaction: discord.Interaction):
     
 @tree.command(name="user", description="👤 Check Veil User Stats")
 @app_commands.describe(user="The user to check (optional)")
-async def user_stats(interaction: discord.Interaction, user: discord.Member = None):
+async def user_stats(interaction: discord.Interaction, user: discord.Member | None = None):
     target = user or interaction.user
-    embed = build_user_stats_embed_and_file(interaction.guild, target)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # build_user_stats_embed_and_file should return (embed, file)
+    embed, file = build_user_stats_embed_and_file(interaction.guild, target)
+
+    if file:
+        await interaction.response.send_message(embed=embed, file=file, ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @tree.command(name="veil", description="💬 Send a Message Behind a Veil")
 @app_commands.describe(message="The message you want to send anonymously.")
