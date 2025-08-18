@@ -2054,15 +2054,18 @@ class UnveilView(discord.ui.View):
         # Shuffle so the order is NOT alphabetical and the author position is random too
         random.shuffle(unique_members)
 
-        # Build menu options
-        options = [
-            discord.SelectOption(
-                label=get_display_name_safe(member),
-                value=str(member.id)
-            )
-            for member in unique_members
-        ]
-
+        # Build menu options (use only the username)
+        used_labels = set()
+        options = []
+        for member in unique_members:
+            label = member.name  # actual Discord username, no discriminator
+            if label in used_labels:
+                # if dupes, make it unique by tacking on last 4 digits of ID
+                label = f"{label} · {str(member.id)[-4:]}"
+            used_labels.add(label)
+        
+            options.append(discord.SelectOption(label=label[:100], value=str(member.id)))
+        
         # Attach the dropdown
         self.add_item(UnveilDropdown(message_id, author_id, options))
 
