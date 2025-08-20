@@ -6,3 +6,5 @@ requests==2.32.3
 stripe==10.9.0
 emoji==2.12.1
 regex==2024.5.15
+arabic-reshaper==3.0.0
+python-bidi==0.4.2
