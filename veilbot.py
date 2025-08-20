@@ -12,6 +12,7 @@ from discord import PartialEmoji
 from typing import Optional
 from bidi.algorithm import get_display
 from io import BytesIO
+from pathlib import Path
 import io
 import os
 import re
