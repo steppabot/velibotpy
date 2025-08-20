@@ -334,7 +334,7 @@ DEVANAGARI_RE = re.compile(r'[\u0900-\u097F]')
 FONT_MAP = {
     "latin": "ariblk.ttf",        # English + Latin
     "arabic": "arabic.ttf",       # NotoNaskhArabic
-    "cjk": "chinese.ttf",         # NotoSansSC/TC
+    "cjk": "chinese2.ttf",         # NotoSansSC/TC
     "devanagari": "indian.ttf",   # NotoSansDevanagari
 }
 
