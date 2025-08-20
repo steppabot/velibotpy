@@ -1526,11 +1526,18 @@ async def send_veil_message(interaction, text, channel, unveiled=False, return_f
     emoji_size = 48
     emoji_padding = 4
 
-    tokens = tokenize_message_for_wrap(text)
+    # --- Arabic detect + shape ---
+    use_arabic = is_arabic_text(text)
+    render_text = shape_rtl(text) if use_arabic else text
+    
+    # If your tokenizer splits emojis/words, feed it the shaped string
+    tokens = tokenize_message_for_wrap(render_text)
 
     # Adjust font to fit text
     for font_size in range(56, 24, -2):
-        font = ImageFont.truetype("ariblk.ttf", font_size)
+        font = ImageFont.truetype(
+            "NotoSans-Regular.ttf" if use_arabic else "ariblk.ttf",
+            font_size)
         ascent, descent = font.getmetrics()
         line_height = max(emoji_size, ascent + descent)
         lines = build_wrapped_lines(tokens, font, box_width, draw, emoji_size, emoji_padding)
