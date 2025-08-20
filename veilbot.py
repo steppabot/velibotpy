@@ -1536,7 +1536,7 @@ async def send_veil_message(interaction, text, channel, unveiled=False, return_f
     # Adjust font to fit text
     for font_size in range(56, 24, -2):
         font = ImageFont.truetype(
-            "NotoSans-Regular.ttf" if use_arabic else "ariblk.ttf",
+            "arabic.ttf" if use_arabic else "ariblk.ttf",
             font_size)
         ascent, descent = font.getmetrics()
         line_height = max(emoji_size, ascent + descent)
