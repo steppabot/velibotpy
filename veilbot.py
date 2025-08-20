@@ -35,6 +35,20 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 # Load database URL from environment
 DATABASE_URL = os.getenv("DATABASE_URL")
+BASIC_DIR = Path(__file__).resolve().parent
+# Fix your actual file names here:
+LATIN_FONT = BASIC_DIR / "ariblk.ttf"                 # <-- not arlblk.tff
+ARABIC_FONT = BASIC_DIR / "NotoNaskhArabic-Regular.ttf"  # or NotoSansArabic-Regular.ttf
+ARABIC_RE = re.compile(r'[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]+')
+
+def is_arabic(s): return bool(ARABIC_RE.search(s))
+def shape_rtl(s): return get_display(arabic_reshaper.reshape(s))
+
+def load_font(path: Path, size: int):
+    if not path.exists():
+        raise FileNotFoundError(f"Font not found: {path}")
+    return ImageFont.truetype(str(path), size)
+
 
 @contextlib.contextmanager
 def get_safe_cursor():
@@ -330,7 +344,6 @@ discord_emoji_pattern = re.compile(r"<a?:\w+:(\d+)>", re.IGNORECASE)
 TWEMOJI_BASE = "https://cdn.jsdelivr.net/gh/twitter/twemoji@latest/assets/72x72"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # folder where veilbot.py is
 PNG_EMOJI_DIR = os.path.join(BASE_DIR, "png")
-ARABIC_RE = re.compile(r'[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]+')
 
 
 def is_arabic_text(s: str) -> bool:
@@ -1538,9 +1551,12 @@ async def send_veil_message(interaction, text, channel, unveiled=False, return_f
     
     tokens = tokenize_message_for_wrap(shaped_text)  # keep emojis as-is
 
-    # Adjust font to fit text
+    use_ar = is_arabic(text)
+    font_path = ARABIC_FONT if use_ar else LATIN_FONT
+    shaped = shape_rtl(text) if use_ar else text
+    
     for font_size in range(56, 24, -2):
-        font = ImageFont.truetype(font_path_for_pass, font_size)
+        font = load_font(font_path, font_size)
         ascent, descent = font.getmetrics()
         line_height = max(emoji_size, ascent + descent)
         lines = build_wrapped_lines(tokens, font, box_width, draw, emoji_size, emoji_padding)
