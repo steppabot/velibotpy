@@ -330,6 +330,7 @@ PNG_EMOJI_DIR = os.path.join(BASE_DIR, "png")
 ARABIC_RE = re.compile(r'[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]')
 CJK_RE = re.compile(r'[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]')
 DEVANAGARI_RE = re.compile(r'[\u0900-\u097F]')
+MENTION_RE = re.compile(r"<(@!?|@&|#)(\d+)>")
 
 FONT_MAP = {
     "latin": "ariblk.ttf",        # English + Latin
@@ -337,6 +338,57 @@ FONT_MAP = {
     "cjk": "chinese3.ttf",         # NotoSansSC/TC
     "devanagari": "indian.ttf",   # NotoSansDevanagari
 }
+
+def _safe_display_name(member):
+    return member.display_name if member else None
+
+async def normalize_mentions(text: str, guild: discord.Guild, client: discord.Client) -> str:
+    """Turn <@id>, <@!id>, <@&id>, <#id> into @name / @role / #channel (no pings)."""
+    if not text or not guild:
+        return text
+
+    replacements = {}
+
+    for kind, raw_id in MENTION_RE.findall(text):
+        full_tag = f"<{kind}{raw_id}>"
+        if full_tag in replacements:
+            continue
+
+        _id = int(raw_id)
+
+        if kind.startswith("@"):  # user mention <@id> or <@!id>
+            name = None
+            m = guild.get_member(_id)
+            if m:
+                name = _safe_display_name(m)
+            else:
+                # fallback to global user cache / fetch (non-blocking if cached)
+                u = client.get_user(_id)
+                if not u:
+                    try:
+                        u = await client.fetch_user(_id)
+                    except Exception:
+                        u = None
+                name = (u.global_name or u.name) if u else f"user:{_id}"
+            replacements[full_tag] = f"@{name}"
+
+        elif kind == "@&":  # role mention
+            role = guild.get_role(_id)
+            replacements[full_tag] = f"@{role.name}" if role else f"@role:{_id}"
+
+        elif kind == "#":   # channel mention
+            ch = guild.get_channel(_id)
+            replacements[full_tag] = f"#{ch.name}" if ch and hasattr(ch, "name") else f"#chan:{_id}"
+
+    # apply replacements
+    if not replacements:
+        return text
+
+    def sub_fn(m):
+        kind, raw_id = m.groups()
+        return replacements.get(f"<{kind}{raw_id}>", m.group(0))
+
+    return MENTION_RE.sub(sub_fn, text)
 
 def detect_script(text: str) -> str:
     if ARABIC_RE.search(text):
@@ -1555,7 +1607,9 @@ async def send_veil_message(interaction, text, channel, unveiled=False, return_f
     emoji_size = 48
     emoji_padding = 4
 
-
+    # 🔹 normalize mentions
+    text = await normalize_mentions(text, interaction.guild, interaction.client)
+    
     render_text, font_file = get_render_text_and_font(text)
     tokens = tokenize_message_for_wrap(render_text)
         
