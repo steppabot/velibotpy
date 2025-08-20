@@ -26,9 +26,6 @@ import regex
 import contextlib
 import arabic_reshaper
 
-
-
-
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -330,11 +327,43 @@ discord_emoji_pattern = re.compile(r"<a?:\w+:(\d+)>", re.IGNORECASE)
 TWEMOJI_BASE = "https://cdn.jsdelivr.net/gh/twitter/twemoji@latest/assets/72x72"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # folder where veilbot.py is
 PNG_EMOJI_DIR = os.path.join(BASE_DIR, "png")
-ARABIC_RE = re.compile(r'[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]+')
+ARABIC_RE = re.compile(r'[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]')
+CJK_RE = re.compile(r'[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]')
+DEVANAGARI_RE = re.compile(r'[\u0900-\u097F]')
 
+FONT_MAP = {
+    "latin": "ariblk.ttf",        # English + Latin
+    "arabic": "arabic.ttf",       # NotoNaskhArabic
+    "cjk": "chinese.ttf",         # NotoSansSC/TC
+    "devanagari": "indian.ttf",   # NotoSansDevanagari
+}
 
-def is_arabic_text(s: str) -> bool:
-    return bool(ARABIC_RE.search(s))
+def detect_script(text: str) -> str:
+    if ARABIC_RE.search(text):
+        return "arabic"
+    if CJK_RE.search(text):
+        return "cjk"
+    if DEVANAGARI_RE.search(text):
+        return "devanagari"
+    return "latin"
+
+def get_render_text_and_font(text: str):
+    script = detect_script(text)
+
+    if script == "arabic":
+        render_text = shape_rtl(text)
+        font_file = FONT_MAP["arabic"]
+    elif script == "cjk":
+        render_text = text  # no shaping
+        font_file = FONT_MAP["cjk"]
+    elif script == "devanagari":
+        render_text = text  # no shaping
+        font_file = FONT_MAP["devanagari"]
+    else:
+        render_text = text
+        font_file = FONT_MAP["latin"]
+
+    return render_text, font_file
 
 def shape_rtl(s: str) -> str:
     # reshape Arabic letters into contextual forms, then reorder visually (RTL)
@@ -1526,18 +1555,12 @@ async def send_veil_message(interaction, text, channel, unveiled=False, return_f
     emoji_size = 48
     emoji_padding = 4
 
-    # --- Arabic detect + shape ---
-    use_arabic = is_arabic_text(text)
-    render_text = shape_rtl(text) if use_arabic else text
-    
-    # If your tokenizer splits emojis/words, feed it the shaped string
-    tokens = tokenize_message_for_wrap(render_text)
 
-    # Adjust font to fit text
+    render_text, font_file = get_render_text_and_font(text)
+    tokens = tokenize_message_for_wrap(render_text)
+        
     for font_size in range(56, 24, -2):
-        font = ImageFont.truetype(
-            "arabic.ttf" if use_arabic else "ariblk.ttf",
-            font_size)
+        font = ImageFont.truetype(font_file, font_size)
         ascent, descent = font.getmetrics()
         line_height = max(emoji_size, ascent + descent)
         lines = build_wrapped_lines(tokens, font, box_width, draw, emoji_size, emoji_padding)
