@@ -1937,10 +1937,30 @@ class UnveilDropdown(discord.ui.Select):
 
             is_correct = (guessed_user_id == real_author_id)
 
+            # ✅ Prevent duplicate (message_id, guesser_id) with ON CONFLICT
             cur.execute("""
                 INSERT INTO veil_guesses (message_id, guesser_id, guessed_user_id, is_correct)
                 VALUES (%s, %s, %s, %s)
+                ON CONFLICT (message_id, guesser_id) DO NOTHING
+                RETURNING 1
             """, (self.message_id, guesser_id, guessed_user_id, is_correct))
+        
+            inserted = (cur.fetchone() is not None)
+        
+            if not inserted:
+                # User already guessed this veil — don't charge another 5 coins, don't bump guess_count
+                # If you already deducted coins above, optionally refund here:
+                if not is_elite:
+                    add_user_coins(guesser_id, guild_id, 5)
+                conn.commit()
+                return await interaction.edit_original_response(
+                    embed=discord.Embed(
+                        title=f"{incorrectmoji} You Already Guessed",
+                        description="You’ve already made a guess on this veil.",
+                        color=0x992d22
+                    ),
+                    view=None
+                )
 
             guess_count += 1
 
