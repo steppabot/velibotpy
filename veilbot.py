@@ -10,6 +10,7 @@ from psycopg2 import sql
 from copy import deepcopy
 from discord import PartialEmoji
 from typing import Optional
+from bidi.algorithm import get_display
 from io import BytesIO
 import io
 import os
@@ -23,6 +24,10 @@ import asyncio
 import emoji
 import regex
 import contextlib
+import arabic_reshaper
+
+
+
 
 load_dotenv()
 
@@ -325,6 +330,16 @@ discord_emoji_pattern = re.compile(r"<a?:\w+:(\d+)>", re.IGNORECASE)
 TWEMOJI_BASE = "https://cdn.jsdelivr.net/gh/twitter/twemoji@latest/assets/72x72"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # folder where veilbot.py is
 PNG_EMOJI_DIR = os.path.join(BASE_DIR, "png")
+ARABIC_RE = re.compile(r'[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]+')
+
+
+def is_arabic_text(s: str) -> bool:
+    return bool(ARABIC_RE.search(s))
+
+def shape_rtl(s: str) -> str:
+    # reshape Arabic letters into contextual forms, then reorder visually (RTL)
+    reshaped = arabic_reshaper.reshape(s)
+    return get_display(reshaped)
 
 def count_emojis_all(text: str) -> int:
     custom = len(CUSTOM_EMOJI_RE.findall(text))
@@ -1511,11 +1526,21 @@ async def send_veil_message(interaction, text, channel, unveiled=False, return_f
     emoji_size = 48
     emoji_padding = 4
 
-    tokens = tokenize_message_for_wrap(text)
+    # Choose font path based on script
+    latin_font_path = "ariblk.ttf"
+    arabic_font_path = "NotoNaskhArabic-Regular.ttf"   # <- add this file to your repo
+    
+    use_arabic = is_arabic_text(text)
+    font_path_for_pass = arabic_font_path if use_arabic else latin_font_path
+    
+    # Shape RTL before any measurement/tokenization
+    shaped_text = shape_rtl(text) if use_arabic else text
+    
+    tokens = tokenize_message_for_wrap(shaped_text)  # keep emojis as-is
 
     # Adjust font to fit text
     for font_size in range(56, 24, -2):
-        font = ImageFont.truetype("ariblk.ttf", font_size)
+        font = ImageFont.truetype(font_path_for_pass, font_size)
         ascent, descent = font.getmetrics()
         line_height = max(emoji_size, ascent + descent)
         lines = build_wrapped_lines(tokens, font, box_width, draw, emoji_size, emoji_padding)
