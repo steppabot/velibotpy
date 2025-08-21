@@ -3741,6 +3741,7 @@ async def remove_veil_error(interaction: discord.Interaction, error):
         )
 
 @tree.command(name="guilds", description="(Owner) List all guilds the bot is in")
+@app_commands.default_permissions(administrator=True)  # hides from non-admins in the picker
 async def guilds_cmd(inter: discord.Interaction):
     # Owner gate (safer than admin-gating since this reveals other servers)
     if inter.user.id not in OWNER_IDS:
@@ -3790,18 +3791,19 @@ async def guilds_cmd(inter: discord.Interaction):
             ephemeral=True
         )
 
+
 # ---- admin-only shards command ----
 @tree.command(name="shards", description="Show shard status")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)  # hides from non-admins in the picker
 async def shards_cmd(inter: discord.Interaction):
-    # Runtime guard (in case permissions changed or default perms overridden)
-    if not inter.user.guild_permissions.administrator:
-        incorrectmoji = str(client.app_emojis.get("veilincorrect", "⚠️"))
+    # Owner gate (safer than admin-gating since this reveals other servers)
+    if inter.user.id not in OWNER_IDS:
+        incorrectmoji = str(client.app_emojis.get("veilincorrect", "❌"))
         return await inter.response.send_message(
             embed=discord.Embed(
-                title=f"{incorrectmoji} Admin Only",
-                description="You must be a server admin to use this command.",
+                title=f"{incorrectmoji} Owner Only",
+                description="This command is restricted.",
                 color=0x992d22
             ),
             ephemeral=True
