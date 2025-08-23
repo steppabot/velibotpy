@@ -3292,6 +3292,19 @@ async def info(interaction: discord.Interaction):
     embed, view = await build_bot_info_embed(interaction.guild)
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
+@info.error
+async def info_error(interaction: discord.Interaction, error: AppCommandError):
+    if isinstance(error, CheckFailure):
+        incorrectmoji = str(client.app_emojis["veilincorrect"]) 
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title=f"{incorrectmoji} Admin Only",
+                description="You must be an **administrator** to use this command.",
+                color=0x992d22
+            ),
+            ephemeral=True
+        )
+
 @tree.command(name="leaderboard", description="🏆 Show the top unveilers")
 async def leaderboard(interaction: discord.Interaction):
     guild = interaction.guild
