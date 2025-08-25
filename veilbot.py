@@ -716,19 +716,6 @@ def is_visually_blank(name):
 
     return not any(c.isalnum() for c in stripped) or only_symbols
 
-def is_visually_blank(name):
-    stripped = name.strip()
-    if not stripped:
-        return True
-
-    # Remove common invisible or formatting characters
-    stripped = ''.join(c for c in stripped if not unicodedata.category(c).startswith('C'))
-
-    # If it's only punctuation or symbols, consider it blank
-    only_symbols = all(c in string.punctuation or unicodedata.category(c).startswith('S') for c in stripped)
-
-    return not any(c.isalnum() for c in stripped) or only_symbols
-
 def get_display_name_safe(member):
     name = member.display_name
     return member.name if is_visually_blank(name) else name
