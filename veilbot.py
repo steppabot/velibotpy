@@ -693,7 +693,28 @@ def build_wrapped_lines(tokens, font, box_width, draw, emoji_size=48, emoji_padd
     return lines
 
 def calculate_line_y(line_tokens, font, base_y):
+    """Adjust baseline if line is mostly emoji (iOS/multi-emoji fix)."""
+    ascent, _ = font.getmetrics()
+    emoji_count = sum(
+        1 for t in line_tokens
+        if discord_emoji_pattern.fullmatch(t) or emoji.is_emoji(t.strip())
+    )
+    if line_tokens and emoji_count >= len(line_tokens) * 0.7:
+        return base_y + int(ascent * 0.35)  # shift down for emoji alignment
     return base_y
+
+def is_visually_blank(name):
+    stripped = name.strip()
+    if not stripped:
+        return True
+
+    # Remove common invisible or formatting characters
+    stripped = ''.join(c for c in stripped if not unicodedata.category(c).startswith('C'))
+
+    # If it's only punctuation or symbols, consider it blank
+    only_symbols = all(c in string.punctuation or unicodedata.category(c).startswith('S') for c in stripped)
+
+    return not any(c.isalnum() for c in stripped) or only_symbols
 
 def is_visually_blank(name):
     stripped = name.strip()
