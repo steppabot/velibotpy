@@ -3927,4 +3927,3 @@ async def on_message(message: discord.Message):
 if __name__ == "__main__":
     init_db()  # ✅ just to ensure veil_subscriptions exists before on_guild_join runs
     client.run(TOKEN)
-
