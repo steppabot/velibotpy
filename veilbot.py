@@ -1624,8 +1624,8 @@ def prepare_photo_for_window(
     w: int,
     h: int,
     *,
-    hybrid_threshold: float = 0.25,   # if <70% of target and tiny, use blur pad
-    tiny_px: int = 150,
+    hybrid_threshold: float = 0.4,   # if <70% of target and tiny, use blur pad
+    tiny_px: int = 400,
     radius: int = 24,
     pan: tuple[int, int] = (0, 0),   # NEW: crop pan passed through
 ) -> Image.Image:
