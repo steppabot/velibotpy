@@ -71,38 +71,18 @@ def init_db():
                 timestamp TIMESTAMPTZ DEFAULT NOW()
             )
         ''')
-
         cursor.execute("""
             SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name = 'veil_messages'
+              FROM information_schema.columns
+             WHERE table_name = 'veil_messages'
         """)
         cols = {row[0] for row in cursor.fetchall()}
-
         if 'guess_count' not in cols:
             cursor.execute("ALTER TABLE veil_messages ADD COLUMN guess_count INTEGER DEFAULT 0")
         if 'is_unveiled' not in cols:
             cursor.execute("ALTER TABLE veil_messages ADD COLUMN is_unveiled BOOLEAN DEFAULT FALSE")
         if 'veil_number' not in cols:
             cursor.execute("ALTER TABLE veil_messages ADD COLUMN veil_number INTEGER")
-
-        # 🔹 New image-related fields
-        if 'is_image' not in cols:
-            cursor.execute("ALTER TABLE veil_messages ADD COLUMN is_image BOOLEAN NOT NULL DEFAULT FALSE")
-        if 'frame_key' not in cols:
-            cursor.execute("ALTER TABLE veil_messages ADD COLUMN frame_key TEXT")
-        if 'pan_x' not in cols:
-            cursor.execute("ALTER TABLE veil_messages ADD COLUMN pan_x INTEGER")
-        if 'pan_y' not in cols:
-            cursor.execute("ALTER TABLE veil_messages ADD COLUMN pan_y INTEGER")
-        if 'nudge_x' not in cols:
-            cursor.execute("ALTER TABLE veil_messages ADD COLUMN nudge_x INTEGER")
-        if 'nudge_y' not in cols:
-            cursor.execute("ALTER TABLE veil_messages ADD COLUMN nudge_y INTEGER")
-        if 'prepared_png' not in cols:
-            cursor.execute("ALTER TABLE veil_messages ADD COLUMN prepared_png BYTEA")
-        if 'image_mime' not in cols:
-            cursor.execute("ALTER TABLE veil_messages ADD COLUMN image_mime TEXT")
 
         cursor.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_vm_channel_veilno
@@ -351,35 +331,6 @@ ARABIC_RE = re.compile(r'[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]')
 CJK_RE = re.compile(r'[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]')
 DEVANAGARI_RE = re.compile(r'[\u0900-\u097F]')
 MENTION_RE = re.compile(r"<(@!?|@&|#)(\d+)>")
-VEIL_FRAMES = {
-    "landscape": {
-        "file": "landscapeframe.png",
-        "file_unveiled": "landscapeframeunveiled.png",
-        "frame_size": (1318, 887),         # full PNG size
-        "window": (22, 8, 1235, 704),      # hole coords (x, y, w, h)
-        "nudge": (0, 155),                   # move entire photo block under frame
-        "pan": (0, -20),                    # pan crop down ~40px
-        "radius": 28
-    },
-    "portrait": {
-        "file": "portraitframe.png",
-        "file_unveiled": "portraitframeunveiled.png",
-        "frame_size": (900, 1300),         # full PNG size
-        "window": (22, 8, 818, 1119),      # hole coords (x, y, w, h)
-        "nudge": (0, 139),
-        "pan": (0, -20),                    # nudge crop down a bit (adjust as needed)
-        "radius": 28
-    },
-    "square": {
-        "file": "squareframe.png",
-        "file_unveiled": "squareframeunveiled.png",
-        "frame_size": (1150, 1185),
-        "window": (22, 8, 1074, 1011),
-        "nudge": (0, 139),
-        "pan": (0, -20),                    # crop pan ~20px down
-        "radius": 24
-    },
-}
 
 FONT_MAP = {
     "latin": "ariblk.ttf",        # English + Latin
@@ -695,11 +646,11 @@ async def render_emojis(draw, image, tokens, x_start, y, font, emoji_size, emoji
     return x_start
     
 def build_wrapped_lines(tokens, font, box_width, draw, emoji_size=48, emoji_padding=4):
-    lines = []
-    current_line = []
+    lines: list[list[str]] = []
+    current_line: list[str] = []
     current_width = 0
 
-    def token_width(token):
+    def token_width(token: str) -> int:
         if discord_emoji_pattern.fullmatch(token) or emoji.is_emoji(token.strip()):
             return emoji_size + emoji_padding
         return draw.textlength(token, font=font)
@@ -707,35 +658,27 @@ def build_wrapped_lines(tokens, font, box_width, draw, emoji_size=48, emoji_padd
     for token in tokens:
         width = token_width(token)
 
-        # Ignore leading spaces
         if token.isspace() and not current_line:
             continue
 
-        # Check if token is longer than the box
         if width > box_width:
             if current_line:
                 lines.append(current_line)
                 current_line = []
                 current_width = 0
 
-            # Force split word by pixel width
-            split_parts = []
             current_part = ""
             for char in token:
                 test_part = current_part + char
                 if draw.textlength(test_part, font=font) > box_width and current_part:
-                    split_parts.append(current_part)
+                    lines.append([current_part])
                     current_part = char
                 else:
                     current_part = test_part
             if current_part:
-                split_parts.append(current_part)
-
-            for part in split_parts:
-                lines.append([part])
+                lines.append([current_part])
             continue
 
-        # Normal wrapping
         if current_width + width > box_width:
             lines.append(current_line)
             current_line = [] if token.isspace() else [token]
@@ -1583,323 +1526,10 @@ async def hydrate_latest_views():
         except discord.HTTPException as e:
             print(f"⚠️ Failed to restore latest veil {latest_id}: {e}")
 
-def _exif(im: Image.Image) -> Image.Image:
-    try:
-        return ImageOps.exif_transpose(im)
-    except Exception:
-        return im
-
-def _cover_fit(img: Image.Image, tw: int, th: int, *, pan: tuple[int, int] = (0, 0)) -> Image.Image:
-    """
-    Scale to cover target box, then crop (no distortion).
-    pan=(px, py) offsets the crop AFTER scaling, in output pixels.
-      +px -> crop moves right (content shifts left)
-      +py -> crop moves down  (content shifts up)
-    """
-    sw, sh = img.size
-    scale = max(tw / sw, th / sh)
-    nw, nh = int(sw * scale + 0.5), int(sh * scale + 0.5)
-    img = img.resize((nw, nh), Image.LANCZOS)
-
-    # centered crop + pan
-    cx, cy = nw // 2, nh // 2
-    half_w, half_h = tw // 2, th // 2
-    px, py = pan
-
-    left   = cx - half_w + px
-    top    = cy - half_h + py
-    # clamp to bounds
-    left   = max(0, min(left, nw - tw))
-    top    = max(0, min(top, nh - th))
-    right  = left + tw
-    bottom = top + th
-
-    return img.crop((left, top, right, bottom))
-
-def prepare_photo_for_window(
-    user_img: Image.Image,
-    w: int,
-    h: int,
-    *,
-    hybrid_threshold: float = 0.25,   # if <70% of target and tiny, use blur pad
-    tiny_px: int = 150,
-    radius: int = 24,
-    pan: tuple[int, int] = (0, 0),   # NEW: crop pan passed through
-) -> Image.Image:
-    user_img = _exif(user_img).convert("RGB")
-    sw, sh = user_img.size
-    use_blur_pad = (sw < w * hybrid_threshold or sh < h * hybrid_threshold) and min(sw, sh) < tiny_px
-
-    if not use_blur_pad:
-        # pan-aware cover fit
-        photo = _cover_fit(user_img, w, h, pan=pan).convert("RGBA")
-    else:
-        # background: no pan (uniform blur)
-        bg = _cover_fit(user_img, w, h, pan=(0, 0)).convert("RGBA")
-        bg = bg.filter(ImageFilter.GaussianBlur(28))
-        dark = Image.new("RGBA", (w, h), (0, 0, 0, 140))
-        bg = Image.alpha_composite(bg, dark)
-
-        # foreground: smaller, but respect pan so subject shifts
-        pad = 0.85
-        fw, fh = int(w * pad), int(h * pad)
-        fg = _cover_fit(user_img, fw, fh, pan=pan).convert("RGBA")
-
-        photo = bg.copy()
-        ox, oy = (w - fw) // 2, (h - fh) // 2
-        photo.alpha_composite(fg, (ox, oy))
-
-    # inner shadow + rounded mask
-    shadow_a = _inner_shadow((w, h), radius=26, strength=160)
-    shadow_rgba = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    shadow_rgba.putalpha(shadow_a)
-    photo = Image.alpha_composite(shadow_rgba, photo)
-
-    if radius:
-        mask = _rounded_mask(w, h, radius)
-        clipped = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        clipped.paste(photo, (0, 0), mask)
-        return clipped
-
-    return photo
-
-def _rounded_mask(w: int, h: int, r: int) -> Image.Image:
-    m = Image.new("L", (w, h), 0)
-    d = ImageDraw.Draw(m)
-    d.rounded_rectangle((0, 0, w, h), r, fill=255)
-    return m
-
-def _inner_shadow(size, radius=26, strength=160):
-    w, h = size
-    base = Image.new("L", (w, h), 0)
-    d = ImageDraw.Draw(base)
-    inset = max(2, radius // 3)
-    d.rectangle((inset, inset, w - inset, h - inset), fill=strength)
-    return base.filter(ImageFilter.GaussianBlur(radius))
-
-def pick_frame_key_for_image(img: Image.Image) -> str:
-    w, h = img.size
-    ar = w / max(h, 1)
-    if ar >= 1.15:  # fairly wide
-        return "landscape"
-    if ar <= 0.87:  # fairly tall
-        return "portrait"
-    return "square"
-
-async def read_attachment_image(att: discord.Attachment) -> Image.Image | None:
-    try:
-        data = await att.read()
-        im = Image.open(io.BytesIO(data))
-        im.load()
-        return _exif(im).convert("RGB")
-    except Exception:
-        return None
-
-def compose_framed_card(frame_key: str, user_img: Image.Image, unveiled: bool = False) -> Image.Image:
-    meta = VEIL_FRAMES[frame_key]
-    frame_path = meta["file_unveiled"] if unveiled else meta["file"]
-    frame = Image.open(frame_path).convert("RGBA")
-
-    x, y, w, h = meta["window"]
-    dx, dy = meta.get("nudge", (0, 0))
-    pan = meta.get("pan", (0, 0))
-    radius = meta.get("radius", 0)
-
-    prepared = prepare_photo_for_window(user_img, w, h, radius=radius, pan=pan)
-
-    out = Image.new("RGBA", frame.size, (0, 0, 0, 0))
-    out.alpha_composite(prepared, (x + dx, y + dy))  # photo behind
-    out.alpha_composite(frame, (0, 0))               # frame on top
-    return out
-
-async def send_veil_message(
-    interaction,
-    text,
-    channel,
-    *,
-    image_attachment: discord.Attachment | None = None,  # 👈 new (optional)
-    unveiled: bool = False,
-    return_file: bool = False,
-    veil_msg_id: int | None = None
-):
-    """
-    Sends either a TEXT veil (existing behavior) or an IMAGE veil.
-    For IMAGE veils we:
-      1) prepare the window-sized PNG and store it + metadata in DB
-      2) compose the posted card (prepared window behind the frame)
-    """
-
-    # ---------- helpers (scoped here so you can paste this block as-is) ----------
-    def _prepare_window_only(frame_key: str, user_img: Image.Image) -> tuple[bytes, dict]:
-        meta = VEIL_FRAMES[frame_key]
-        x, y, w, h = meta["window"]
-        dx, dy = meta.get("nudge", (0, 0))
-        pan = meta.get("pan", (0, 0))
-        radius = meta.get("radius", 0)
-
-        prepared_im = prepare_photo_for_window(user_img, w, h, radius=radius, pan=pan)
-        buf = io.BytesIO()
-        prepared_im.save(buf, format="PNG")
-        prepared_png = buf.getvalue()
-
-        meta_fields = {
-            "frame_key": frame_key,
-            "pan_x": pan[0],
-            "pan_y": pan[1],
-            "nudge_x": dx,
-            "nudge_y": dy,
-        }
-        return prepared_png, meta_fields
-
-    def _compose_from_prepared(prepared_png: bytes, frame_key: str, *, unveiled: bool) -> Image.Image:
-        meta = VEIL_FRAMES[frame_key]
-        frame_path = meta["file_unveiled"] if unveiled else meta["file"]
-        frame = Image.open(frame_path).convert("RGBA")
-
-        x, y, w, h = meta["window"]
-        dx, dy = meta.get("nudge", (0, 0))
-
-        prepared = Image.open(io.BytesIO(prepared_png)).convert("RGBA")
-        # safety: ensure prepared matches the window size
-        if prepared.size != (w, h):
-            prepared = prepared.resize((w, h), Image.LANCZOS)
-
-        out = Image.new("RGBA", frame.size, (0, 0, 0, 0))
-        out.alpha_composite(prepared, (x + dx, y + dy))   # photo behind
-        out.alpha_composite(frame, (0, 0))                # frame on top
-        return out
-    # ---------------------------------------------------------------------------
-
-    # Use the configured channel for live bot (as in your original)
+async def send_veil_message(interaction, text, channel, unveiled=False, return_file=False, veil_msg_id=None):
     channel_id = get_veil_channel(interaction.guild.id)
     channel = interaction.guild.get_channel(channel_id)
 
-    # ========= IMAGE MODE =========
-    if image_attachment is not None:
-        # Validate
-        if not (image_attachment.content_type and image_attachment.content_type.startswith("image/")):
-            await interaction.followup.send("That file isn’t an image I can open (PNG/JPEG).", ephemeral=True)
-            return
-
-        user_img = await read_attachment_image(image_attachment)
-        if user_img is None:
-            await interaction.followup.send("I couldn’t read that image. Try a PNG or JPEG.", ephemeral=True)
-            return
-
-        # choose frame by aspect
-        frame_key = pick_frame_key_for_image(user_img)
-
-        # 1) store the prepared window + metadata
-        prepared_png, meta_fields = _prepare_window_only(frame_key, user_img)
-
-        # 2) compose the actual posted card (veiled)
-        veiled_img = _compose_from_prepared(prepared_png, frame_key, unveiled=False)
-        buf = io.BytesIO()
-        veiled_img.save(buf, format="PNG")
-        img_bytes = buf.getvalue()
-
-        if return_file:
-            return discord.File(io.BytesIO(img_bytes), filename="veil.png")
-
-        # remove "New Veil" button on previous latest
-        prev_msg_id = get_latest_message_id(channel.id)
-        if prev_msg_id:
-            try:
-                old_msg = await channel.fetch_message(prev_msg_id)
-                old_view = build_frozen_view(prev_msg_id, interaction.guild)
-                if old_view:
-                    for child in list(old_view.children):
-                        if isinstance(child, discord.ui.Button) and child.custom_id == "new_btn":
-                            old_view.remove_item(child)
-                    await old_msg.edit(view=old_view)
-            except discord.NotFound:
-                print("⚠️ Old veil message not found, maybe deleted.")
-            except discord.HTTPException as e:
-                print(f"⚠️ Failed to edit old veil: {e}")
-
-        # send the new veil
-        veil_no = claim_next_veil_number(channel.id)
-        view = VeilView(veil_number=veil_no)
-        file_main = discord.File(io.BytesIO(img_bytes), filename="veil.png")
-        msg = await channel.send(file=file_main, view=view)
-
-        # DB insert (image path)
-        try:
-            if conn:
-                with get_safe_cursor() as cur:
-                    cur.execute(
-                        """
-                        INSERT INTO veil_messages
-                          (message_id, channel_id, author_id, content, veil_number, guess_count, is_unveiled,
-                           is_image, frame_key, pan_x, pan_y, nudge_x, nudge_y, prepared_png, image_mime)
-                        VALUES (%s,%s,%s,%s,%s,0,FALSE,
-                                TRUE,%s,%s,%s,%s,%s,%s,%s)
-                        ON CONFLICT (message_id) DO NOTHING
-                        """,
-                        (
-                            msg.id,
-                            msg.channel.id,
-                            interaction.user.id,
-                            "[image]",
-                            veil_no,
-                            meta_fields["frame_key"],
-                            meta_fields["pan_x"],
-                            meta_fields["pan_y"],
-                            meta_fields["nudge_x"],
-                            meta_fields["nudge_y"],
-                            psycopg2.Binary(prepared_png),
-                            image_attachment.content_type or "image/png",
-                        )
-                    )
-                    cur.execute(
-                        """
-                        INSERT INTO latest_veil_messages (channel_id, message_id)
-                        VALUES (%s, %s)
-                        ON CONFLICT (channel_id) DO UPDATE SET message_id = EXCLUDED.message_id
-                        """,
-                        (channel.id, msg.id)
-                    )
-                    conn.commit()
-        except Exception as e:
-            print(f"❌ DB insert failed (image veil): {e}")
-
-        # elite admin copy (same as your existing block)
-        try:
-            with get_safe_cursor() as cur:
-                cur.execute("SELECT tier FROM veil_subscriptions WHERE guild_id = %s", (interaction.guild.id,))
-                tier_row = cur.fetchone()
-
-            if tier_row and tier_row[0] == "elite":
-                with get_safe_cursor() as cur:
-                    cur.execute("SELECT channel_id FROM veil_admin_channels WHERE guild_id = %s", (interaction.guild.id,))
-                    log_row = cur.fetchone()
-
-                if log_row:
-                    log_chan = interaction.guild.get_channel(log_row[0])
-                    if log_chan:
-                        author_member = interaction.guild.get_member(interaction.user.id)
-                        display_name = get_display_name_safe(author_member).capitalize()
-
-                        embed = discord.Embed(title="🗃️ New Veil Submitted")
-                        embed.set_image(url="attachment://veil.png")
-
-                        admin_view = discord.ui.View(timeout=None)
-                        submitted_btn = discord.ui.Button(
-                            label=f"Submitted by {display_name}",
-                            style=discord.ButtonStyle.grey,
-                            custom_id="submitted_by_admin",
-                            disabled=True
-                        )
-                        admin_view.add_item(submitted_btn)
-
-                        file_log = discord.File(io.BytesIO(img_bytes), filename="veil.png")
-                        await log_chan.send(embed=embed, file=file_log, view=admin_view)
-        except Exception as e:
-            print(f"⚠️ Admin log failed (image veil): {e}")
-
-        return msg
-
-    # ========= TEXT MODE (your existing flow) =========
     base_img = "unveilfinal_black2.png" if unveiled else "veilfinal_gold2.png"
     color = "#e5a41a" if unveiled else "#a65e00"
 
@@ -1969,11 +1599,12 @@ async def send_veil_message(
     emoji_size = 48
     emoji_padding = 4
 
-    # normalize mentions
+    # 🔹 normalize mentions
     text = await normalize_mentions(text, interaction.guild, interaction.client)
+    
     render_text, font_file = get_render_text_and_font(text)
     tokens = tokenize_message_for_wrap(render_text)
-
+        
     for font_size in range(56, 24, -2):
         font = ImageFont.truetype(font_file, font_size)
         ascent, descent = font.getmetrics()
@@ -2013,6 +1644,7 @@ async def send_veil_message(
     img_bytes = buffer.getvalue()
 
     if return_file:
+        # return a Discord File so the callback can re-send it correctly
         return discord.File(io.BytesIO(img_bytes), filename="veil.png")
 
     # 1️⃣ Remove "New Veil" from previous latest message
@@ -2020,7 +1652,7 @@ async def send_veil_message(
     if prev_msg_id:
         try:
             old_msg = await channel.fetch_message(prev_msg_id)
-            old_view = build_frozen_view(prev_msg_id, interaction.guild)
+            old_view = build_frozen_view(prev_msg_id, interaction.guild)  # ✅ keeps correct state
             if old_view:
                 for child in list(old_view.children):
                     if isinstance(child, discord.ui.Button) and child.custom_id == "new_btn":
@@ -2037,15 +1669,15 @@ async def send_veil_message(
     file_main = discord.File(io.BytesIO(img_bytes), filename="veil.png")
     msg = await channel.send(file=file_main, view=view)
 
-    # 3️⃣ Insert into DB & update latest veil (text path)
+    # 3️⃣ Insert into DB & update latest veil
     try:
         if conn:
             with get_safe_cursor() as cur:
+                # Insert veil message
                 cur.execute(
                     """
-                    INSERT INTO veil_messages
-                        (message_id, channel_id, author_id, content, veil_number, guess_count, is_unveiled, is_image)
-                    VALUES (%s,%s,%s,%s,%s,0,FALSE,FALSE)
+                    INSERT INTO veil_messages (message_id, channel_id, author_id, content, veil_number, guess_count, is_unveiled)
+                    VALUES (%s, %s, %s, %s, %s, 0, FALSE)
                     ON CONFLICT (message_id) DO NOTHING
                     """,
                     (msg.id, msg.channel.id, interaction.user.id, text, veil_no)
@@ -2056,17 +1688,24 @@ async def send_veil_message(
                     ON CONFLICT (channel_id) DO UPDATE SET message_id = EXCLUDED.message_id
                 """, (channel.id, msg.id))
                 conn.commit()
+                
     except Exception as e:
-        print(f"❌ DB insert failed (text veil): {e}")
+        print(f"❌ DB insert failed: {e}")
 
     # ─────────────────────────────────────────────────────────────────────────
-    # ADMIN LOGS (same as before)
+    # ADMIN LOGS: if this guild is elite, send a copy of the veil to their log channel
     with get_safe_cursor() as cur:
-        cur.execute("SELECT tier FROM veil_subscriptions WHERE guild_id = %s", (interaction.guild.id,))
+        cur.execute(
+            "SELECT tier FROM veil_subscriptions WHERE guild_id = %s",
+            (interaction.guild.id,)
+        )
         tier_row = cur.fetchone()
     if tier_row and tier_row[0] == "elite":
         with get_safe_cursor() as cur:
-            cur.execute("SELECT channel_id FROM veil_admin_channels WHERE guild_id = %s", (interaction.guild.id,))
+            cur.execute(
+                "SELECT channel_id FROM veil_admin_channels WHERE guild_id = %s",
+                (interaction.guild.id,)
+            )
             log_row = cur.fetchone()
 
         if log_row:
@@ -2087,12 +1726,13 @@ async def send_veil_message(
                 )
                 admin_view.add_item(submitted_btn)
 
+                # re-use img_bytes for the admin log
                 file_log = discord.File(io.BytesIO(img_bytes), filename="veil.png")
                 await log_chan.send(embed=embed, file=file_log, view=admin_view)
     # ─────────────────────────────────────────────────────────────────────────
 
     return msg
-
+    
 
 # 🔶 MODAL
 class VeilModal(Modal, title="New Veil"):
@@ -3773,66 +3413,56 @@ async def user_stats(interaction: discord.Interaction, user: discord.Member | No
     else:
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-
 @tree.command(name="veil", description="💬 Send a Message Behind a Veil")
-@app_commands.describe(
-    message="The message you want to send anonymously.",
-    image="Attach an image to send under a Veil (cannot be used with message)."
-)
+@app_commands.describe(message="The message you want to send anonymously.")
 async def veil_command(
-    interaction: discord.Interaction,
-    message: app_commands.Range[str, 1, 1000] | None = None,
-    image: discord.Attachment | None = None
+    interaction: discord.Interaction, 
+    message: app_commands.Range[str, 1, 1000]  # allow longer raw input
 ):
-    incorrectmoji = str(client.app_emojis["veilincorrect"])
-    maskemoji = str(client.app_emojis["veilemoji"])
+    incorrectmoji = str(client.app_emojis["veilincorrect"]) 
+    maskemoji = str(client.app_emojis["veilemoji"]) 
 
-    # XOR enforcement
-    if (message is None and image is None) or (message and image):
+    total_emojis = count_emojis_all(message)
+    if total_emojis > EMOJI_LIMIT:
         return await interaction.response.send_message(
             embed=discord.Embed(
-                title=f"{incorrectmoji} Choose One",
-                description="Please provide **either** a message **or** an image, not both.",
+                title=f"{incorrectmoji} Too Many Emojis",
+                description=f"You can use up to **{EMOJI_LIMIT} emojis** per veil "
+                            f"(custom & animated included). You used **{total_emojis}**.",
                 color=0x992d22
             ),
             ephemeral=True
         )
 
-    # Validate text-only constraints
-    if message:
-        total_emojis = count_emojis_all(message)
-        if total_emojis > EMOJI_LIMIT:
-            return await interaction.response.send_message(
-                embed=discord.Embed(
-                    title=f"{incorrectmoji} Too Many Emojis",
-                    description=(
-                        f"You can use up to **{EMOJI_LIMIT} emojis** per veil "
-                        f"(custom & animated included). You used **{total_emojis}**."
-                    ),
-                    color=0x992d22
+    # 🚫 Visual-length limit (grapheme-aware, emojis count as 1)
+    visual_count = visual_length(message)
+    if visual_count > MAX_VISUAL:
+        return await interaction.response.send_message(
+            embed=discord.Embed(
+                title=f"{incorrectmoji} Message Too Long",
+                description=(
+                    f"Your veil exceeds **{MAX_VISUAL} visual characters** "
+                    f"(emojis count as 1). Current: **{visual_count}**."
                 ),
-                ephemeral=True
-            )
+                color=0x992d22
+            ),
+            ephemeral=True
+        )
 
-        visual_count = visual_length(message)
-        if visual_count > MAX_VISUAL:
-            return await interaction.response.send_message(
-                embed=discord.Embed(
-                    title=f"{incorrectmoji} Message Too Long",
-                    description=(
-                        f"Your veil exceeds **{MAX_VISUAL} visual characters** "
-                        f"(emojis count as 1). Current: **{visual_count}**."
-                    ),
-                    color=0x992d22
-                ),
-                ephemeral=True
-            )
+    # 🚫 Check if veil channel is configured
+    channel_id = get_veil_channel(interaction.guild.id)
+    channel = interaction.guild.get_channel(channel_id) if channel_id else None
+    if not channel:
+        return await interaction.response.send_message(
+            embed=discord.Embed(
+                title=f"{incorrectmoji} Channel Not Linked",
+                description="This server hasn’t linked a Veil channel yet.\nUse **/configure** to set one.",
+                color=0x992d22
+            ),
+            ephemeral=True
+        )
 
-    # ✅ Live mode: use configured Veil channel (fallback to current if missing)
-    cfg_id = get_veil_channel(interaction.guild.id)
-    channel = interaction.guild.get_channel(cfg_id) if cfg_id else interaction.channel  # type: ignore
-
-    # Ack
+    # ⏳ Initial ack to avoid timeouts
     await interaction.response.send_message(
         embed=discord.Embed(
             title=f"{maskemoji} Sending Veil...",
@@ -3842,16 +3472,10 @@ async def veil_command(
         ephemeral=True
     )
 
-    # Dispatch (text may be None if image mode)
-    await send_veil_message(
-        interaction,
-        text=message if message else None,
-        channel=channel,
-        image_attachment=image if image else None,
-        unveiled=False
-    )
+    # 🖼️ Send the actual image/card
+    await send_veil_message(interaction, message, channel)
 
-    # Success
+    # ✅ Success update
     await interaction.edit_original_response(
         embed=discord.Embed(
             title=f"{maskemoji} Veil Sent",
