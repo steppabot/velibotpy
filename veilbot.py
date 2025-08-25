@@ -1762,45 +1762,82 @@ async def send_veil_message(
       2) compose the posted card (prepared window behind the frame)
     """
 
-    # ---------- helpers (scoped here so you can paste this block as-is) ----------
+    # ---------- helpers (drop-in) ----------
     def _prepare_window_only(frame_key: str, user_img: Image.Image) -> tuple[bytes, dict]:
+        """
+        Returns (prepared_window_png_bytes, meta_fields).
+        If we choose contain+pad for extreme aspect ratios (or very tiny imgs),
+        we force nudge=(0,0) so the image stays visually centered.
+        """
         meta = VEIL_FRAMES[frame_key]
         x, y, w, h = meta["window"]
-        dx, dy = meta.get("nudge", (0, 0))
+        dx_cfg, dy_cfg = meta.get("nudge", (0, 0))
         pan = meta.get("pan", (0, 0))
         radius = meta.get("radius", 0)
-
-        prepared_im = prepare_photo_for_window(user_img, w, h, radius=radius, pan=pan)
+    
+        # --- decide whether we're in pad mode (same logic as prepare_photo_for_window) ---
+        sw, sh = user_img.size
+        tgt_ar = w / max(h, 1)
+        src_ar = sw / max(sh, 1)
+        ar_mismatch = max(src_ar / tgt_ar, tgt_ar / src_ar)
+        ar_pad_threshold = 2.0           # <- tweak if you want earlier/later switch
+        hybrid_threshold = 0.25
+        tiny_px = 150
+    
+        tiny_case   = (sw < w * hybrid_threshold or sh < h * hybrid_threshold) and min(sw, sh) < tiny_px
+        extreme_ar  = ar_mismatch >= ar_pad_threshold
+        use_pad     = tiny_case or extreme_ar
+    
+        # prepare window (same function you already use)
+        prepared_im = prepare_photo_for_window(
+            user_img, w, h,
+            radius=radius,
+            pan=pan,
+            hybrid_threshold=hybrid_threshold,
+            tiny_px=tiny_px,
+            ar_pad_threshold=ar_pad_threshold,
+        )
         buf = io.BytesIO()
         prepared_im.save(buf, format="PNG")
         prepared_png = buf.getvalue()
-
+    
+        # IMPORTANT: zero nudge in pad mode so it stays centered
+        ndx, ndy = (0, 0) if use_pad else (dx_cfg, dy_cfg)
+    
         meta_fields = {
             "frame_key": frame_key,
             "pan_x": pan[0],
             "pan_y": pan[1],
-            "nudge_x": dx,
-            "nudge_y": dy,
+            "nudge_x": ndx,
+            "nudge_y": ndy,
+            "used_mode": "pad" if use_pad else "cover",
         }
         return prepared_png, meta_fields
-
-    def _compose_from_prepared(prepared_png: bytes, frame_key: str, *, unveiled: bool) -> Image.Image:
+    
+    
+    def _compose_from_prepared(
+        prepared_png: bytes,
+        frame_key: str,
+        *,
+        unveiled: bool,
+        nudge: tuple[int, int] = (0, 0),   # <- we pass DB-stored nudge here
+    ) -> Image.Image:
         meta = VEIL_FRAMES[frame_key]
         frame_path = meta["file_unveiled"] if unveiled else meta["file"]
         frame = Image.open(frame_path).convert("RGBA")
-
+    
         x, y, w, h = meta["window"]
-        dx, dy = meta.get("nudge", (0, 0))
-
+        dx, dy = nudge
+    
         prepared = Image.open(io.BytesIO(prepared_png)).convert("RGBA")
-        # safety: ensure prepared matches the window size
         if prepared.size != (w, h):
             prepared = prepared.resize((w, h), Image.LANCZOS)
-
+    
         out = Image.new("RGBA", frame.size, (0, 0, 0, 0))
-        out.alpha_composite(prepared, (x + dx, y + dy))   # photo behind
-        out.alpha_composite(frame, (0, 0))                # frame on top
+        out.alpha_composite(prepared, (x + dx, y + dy))
+        out.alpha_composite(frame, (0, 0))
         return out
+    # --------------------------------------
     # ---------------------------------------------------------------------------
 
     # Use the configured channel for live bot (as in your original)
@@ -1826,7 +1863,10 @@ async def send_veil_message(
         prepared_png, meta_fields = _prepare_window_only(frame_key, user_img)
 
         # 2) compose the actual posted card (veiled)
-        veiled_img = _compose_from_prepared(prepared_png, frame_key, unveiled=False)
+        veiled_img = _compose_from_prepared(
+            prepared_png, frame_key, unveiled=False,
+            nudge=(meta_fields["nudge_x"], meta_fields["nudge_y"])
+            )
         buf = io.BytesIO()
         veiled_img.save(buf, format="PNG")
         img_bytes = buf.getvalue()
@@ -2257,6 +2297,26 @@ class UnveilDropdown(discord.ui.Select):
         self.message_id = message_id
         self.author_id = author_id
 
+    # Small helper so this class doesn't depend on a module-level function
+    @staticmethod
+    def _compose_from_prepared_bytes(prepared_png: bytes, frame_key: str, *, unveiled: bool, nudge: tuple[int, int]) -> Image.Image:
+        meta = VEIL_FRAMES[frame_key]
+        frame_path = meta["file_unveiled"] if unveiled else meta["file"]
+        frame = Image.open(io.BytesIO(prepared_png)).convert("RGBA")  # open just to check bytes are valid
+        frame = Image.open(frame_path).convert("RGBA")                 # actual frame image
+
+        x, y, w, h = meta["window"]
+        dx, dy = nudge
+
+        prepared = Image.open(io.BytesIO(prepared_png)).convert("RGBA")
+        if prepared.size != (w, h):
+            prepared = prepared.resize((w, h), Image.LANCZOS)
+
+        out = Image.new("RGBA", frame.size, (0, 0, 0, 0))
+        out.alpha_composite(prepared, (x + dx, y + dy))
+        out.alpha_composite(frame, (0, 0))
+        return out
+
     async def callback(self, interaction: discord.Interaction):
         incorrectmoji = str(client.app_emojis["veilincorrect"])
         veilcoinemoji = str(client.app_emojis["veilcoin"])
@@ -2411,16 +2471,18 @@ class UnveilDropdown(discord.ui.Select):
             if isinstance(child, discord.ui.Button):
                 if child.custom_id == "guess_count":
                     child.label = f"Guesses {guess_count}/3"
-                    child.disabled = True if (is_correct and won) or guess_count >= 3 else child.disabled
-                elif child.custom_id == "guess_btn" and ((is_correct and won) or guess_count >= 3):
-                    child.disabled = True
+                    if (is_correct and won) or guess_count >= 3:
+                        child.disabled = True
+                elif child.custom_id == "guess_btn":
+                    if (is_correct and won) or guess_count >= 3:
+                        child.disabled = True
 
         # 5) Outcomes
         if is_correct and won:
             # Pull data to decide TEXT vs IMAGE unveil
             with get_safe_cursor() as cur:
                 cur.execute("""
-                    SELECT is_image, content, prepared_png, frame_key, author_id
+                    SELECT is_image, content, prepared_png, frame_key, nudge_x, nudge_y, author_id
                     FROM veil_messages
                     WHERE message_id=%s
                 """, (self.message_id,))
@@ -2431,6 +2493,8 @@ class UnveilDropdown(discord.ui.Select):
             if is_image:
                 prepared_png = bytes(row[2]) if row and row[2] is not None else None
                 frame_key    = row[3] if row else None
+                nudge_x      = row[4] if row else 0
+                nudge_y      = row[5] if row else 0
 
                 if not prepared_png or not frame_key:
                     await interaction.edit_original_response(
@@ -2443,7 +2507,9 @@ class UnveilDropdown(discord.ui.Select):
                     )
                     return
 
-                unveiled_img = compose_from_prepared(prepared_png, frame_key, unveiled=True)
+                unveiled_img = self._compose_from_prepared_bytes(
+                    prepared_png, frame_key, unveiled=True, nudge=(nudge_x, nudge_y)
+                )
                 buf = io.BytesIO()
                 unveiled_img.save(buf, format="PNG")
                 buf.seek(0)
@@ -2466,7 +2532,7 @@ class UnveilDropdown(discord.ui.Select):
                     display_name = get_display_name_safe(author_member)
                     child.label = f"Submitted by {display_name.capitalize()}"
 
-            # Lock guessing
+            # Lock guessing, update count
             for child in view.children:
                 if isinstance(child, discord.ui.Button) and child.custom_id == "guess_btn":
                     child.disabled = True
