@@ -1619,34 +1619,62 @@ def _cover_fit(img: Image.Image, tw: int, th: int, *, pan: tuple[int, int] = (0,
 
     return img.crop((left, top, right, bottom))
 
+def _contain_fit(img: Image.Image, tw: int, th: int, *, pan: tuple[int, int]=(0,0)) -> Image.Image:
+    """Scale to fit inside target box without cropping, then center + pan."""
+    sw, sh = img.size
+    scale = min(tw / sw, th / sh)
+    nw, nh = int(sw * scale + 0.5), int(sh * scale + 0.5)
+    img = img.resize((nw, nh), Image.LANCZOS).convert("RGBA")
+
+    px, py = pan
+    # center, then apply pan, clamped so the fitted image stays inside the box
+    ox = (tw - nw) // 2 + px
+    oy = (th - nh) // 2 + py
+    ox = max(-(nw - tw), min(ox, 0))
+    oy = max(-(nh - th), min(oy, 0))
+
+    out = Image.new("RGBA", (tw, th), (0, 0, 0, 0))
+    out.alpha_composite(img, (ox, oy))
+    return out
+
 def prepare_photo_for_window(
     user_img: Image.Image,
     w: int,
     h: int,
     *,
-    hybrid_threshold: float = 0.25,   # if <70% of target and tiny, use blur pad
+    hybrid_threshold: float = 0.25,
     tiny_px: int = 150,
     radius: int = 24,
-    pan: tuple[int, int] = (0, 0),   # NEW: crop pan passed through
+    pan: tuple[int, int] = (0, 0),
+    ar_pad_threshold: float = 2.0,   # NEW: if AR mismatch is extreme, use contain+pad
 ) -> Image.Image:
     user_img = _exif(user_img).convert("RGB")
     sw, sh = user_img.size
-    use_blur_pad = (sw < w * hybrid_threshold or sh < h * hybrid_threshold) and min(sw, sh) < tiny_px
 
-    if not use_blur_pad:
-        # pan-aware cover fit
+    # how extreme is the aspect ratio mismatch?
+    tgt_ar = w / max(h, 1)
+    src_ar = sw / max(sh, 1)
+    ar_mismatch = max(src_ar / tgt_ar, tgt_ar / src_ar)
+    extreme_ar = ar_mismatch >= ar_pad_threshold
+
+    # tiny-image rule you already had
+    tiny_case = (sw < w * hybrid_threshold or sh < h * hybrid_threshold) and min(sw, sh) < tiny_px
+
+    use_pad_mode = extreme_ar or tiny_case
+
+    if not use_pad_mode:
+        # normal cover (crop), honoring pan
         photo = _cover_fit(user_img, w, h, pan=pan).convert("RGBA")
     else:
-        # background: no pan (uniform blur)
+        # blurred/dim background (cover, no pan) + foreground contain (no crop), honoring pan
         bg = _cover_fit(user_img, w, h, pan=(0, 0)).convert("RGBA")
         bg = bg.filter(ImageFilter.GaussianBlur(28))
         dark = Image.new("RGBA", (w, h), (0, 0, 0, 140))
         bg = Image.alpha_composite(bg, dark)
 
-        # foreground: smaller, but respect pan so subject shifts
-        pad = 0.85
+        pad = 0.92
         fw, fh = int(w * pad), int(h * pad)
-        fg = _cover_fit(user_img, fw, fh, pan=pan).convert("RGBA")
+        fg = _contain_fit(user_img, fw, fh, pan=pan).convert("RGBA")
 
         photo = bg.copy()
         ox, oy = (w - fw) // 2, (h - fh) // 2
@@ -1663,7 +1691,6 @@ def prepare_photo_for_window(
         clipped = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         clipped.paste(photo, (0, 0), mask)
         return clipped
-
     return photo
 
 def _rounded_mask(w: int, h: int, r: int) -> Image.Image:
