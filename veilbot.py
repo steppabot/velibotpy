@@ -355,29 +355,32 @@ VEIL_FRAMES = {
     "landscape": {
         "file": "landscapeframe.png",
         "file_unveiled": "landscapeframeunveiled.png",
-        "frame_size": (1318, 887),         # full PNG size
-        "window": (22, 8, 1235, 704),      # hole coords (x, y, w, h)
-        "nudge": (0, 155),                   # move entire photo block under frame
-        "pan": (0, -20),                    # pan crop down ~40px
-        "radius": 28
+        "frame_size": (1318, 887),
+        # old: window=(22, 8, 1235, 704), nudge=(0, 155)
+        "window": (22, 8 + 155, 1235, 704),  # -> (22, 163, 1235, 704)
+        "nudge": (0, 0),
+        "pan": (0, -20),
+        "radius": 28,
     },
     "portrait": {
         "file": "portraitframe.png",
         "file_unveiled": "portraitframeunveiled.png",
-        "frame_size": (900, 1300),         # full PNG size
-        "window": (22, 8, 818, 1119),      # hole coords (x, y, w, h)
-        "nudge": (0, 139),
-        "pan": (0, -20),                    # nudge crop down a bit (adjust as needed)
-        "radius": 28
+        "frame_size": (900, 1300),
+        # old: window=(22, 8, 818, 1119), nudge=(0, 139)
+        "window": (22, 8 + 139, 818, 1119),  # -> (22, 147, 818, 1119)
+        "nudge": (0, 0),
+        "pan": (0, -20),
+        "radius": 28,
     },
     "square": {
         "file": "squareframe.png",
         "file_unveiled": "squareframeunveiled.png",
         "frame_size": (1150, 1185),
-        "window": (22, 8, 1074, 1011),
-        "nudge": (0, 139),
-        "pan": (0, -20),                    # crop pan ~20px down
-        "radius": 24
+        # old: window=(22, 8, 1074, 1011), nudge=(0, 139)
+        "window": (22, 8 + 139, 1074, 1011),  # -> (22, 147, 1074, 1011)
+        "nudge": (0, 0),
+        "pan": (0, -20),
+        "radius": 24,
     },
 }
 
