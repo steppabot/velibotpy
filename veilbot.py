@@ -355,20 +355,22 @@ VEIL_FRAMES = {
     "landscape": {
         "file": "landscapeframe.png",
         "file_unveiled": "landscapeframeunveiled.png",
-        "frame_size": (1318, 887),         # full PNG size
-        "window": (22, 8, 1235, 704),      # hole coords (x, y, w, h)
-        "nudge": (0, 155),                   # move entire photo block under frame
-        "pan": (0, -20),                    # pan crop down ~40px
-        "radius": 28
+        "frame_size": (1318, 887),
+        "window": (22, 8, 1235, 704),
+        "nudge": (0, 155),
+        "pan": (0, -20),
+        "radius": 28,
+        "fit": "auto",   # "auto" | "cover" | "contain" | "contain_plain" | "contain_blur"
     },
     "portrait": {
         "file": "portraitframe.png",
         "file_unveiled": "portraitframeunveiled.png",
-        "frame_size": (900, 1300),         # full PNG size
-        "window": (22, 8, 818, 1119),      # hole coords (x, y, w, h)
+        "frame_size": (900, 1300),
+        "window": (22, 8, 818, 1119),
         "nudge": (0, 139),
-        "pan": (0, -20),                    # nudge crop down a bit (adjust as needed)
-        "radius": 28
+        "pan": (0, -20),
+        "radius": 28,
+        "fit": "auto",
     },
     "square": {
         "file": "squareframe.png",
@@ -376,8 +378,9 @@ VEIL_FRAMES = {
         "frame_size": (1150, 1185),
         "window": (22, 8, 1074, 1011),
         "nudge": (0, 139),
-        "pan": (0, -20),                    # crop pan ~20px down
-        "radius": 24
+        "pan": (0, -20),
+        "radius": 24,
+        "fit": "auto",
     },
 }
 
@@ -1619,40 +1622,121 @@ def _cover_fit(img: Image.Image, tw: int, th: int, *, pan: tuple[int, int] = (0,
 
     return img.crop((left, top, right, bottom))
 
+def _fit_kwargs(fit: str | None) -> dict:
+    """
+    Translate a frame's `fit` override into prepare_photo_for_window kwargs.
+    - "cover"          -> always cover
+    - "contain"        -> always contain + blur
+    - "contain_plain"  -> always plain contain (no blur)
+    - "contain_blur"   -> always contain + blur
+    - "auto"/None      -> let the auto rules decide
+    """
+    if not fit or fit == "auto":
+        return {}
+    if fit == "cover":
+        return dict(small_threshold=0.0, weird_ar_ratio=999.0)
+    if fit == "contain":
+        return dict(small_threshold=1.1, weird_ar_ratio=999.0)  # force the "small" branch -> blurred contain
+    if fit == "contain_blur":
+        return dict(small_threshold=1.1, weird_ar_ratio=0.0)    # also guarantees blurred contain
+    if fit == "contain_plain":
+        return dict(small_threshold=0.0, weird_ar_ratio=0.0)    # skip "small", trigger "weird" -> plain contain
+    return {}
+
+def _contain_fit(img: Image.Image, tw: int, th: int) -> Image.Image:
+    """Scale to fit entirely inside target box (letterbox/pillarbox)."""
+    sw, sh = img.size
+    scale = min(tw / sw, th / sh)
+    nw, nh = max(1, int(sw * scale + 0.5)), max(1, int(sh * scale + 0.5))
+    return img.resize((nw, nh), Image.LANCZOS)
+
+def _center_on_canvas(fg: Image.Image, tw: int, th: int) -> Image.Image:
+    """Center-place fg on an RGBA canvas of (tw, th)."""
+    canvas = Image.new("RGBA", (tw, th), (0, 0, 0, 0))
+    ox = (tw - fg.width) // 2
+    oy = (th - fg.height) // 2
+    canvas.alpha_composite(fg.convert("RGBA"), (ox, oy))
+    return canvas
+
+def _choose_fit_mode(
+    sw: int, sh: int, tw: int, th: int,
+    *, small_threshold: float = 0.5, weird_ar_ratio: float = 1.8
+) -> str:
+    """
+    Returns one of: "cover", "contain_blur", "contain_plain".
+    Rules:
+      - If image is 'small' (any side < 50% of window) -> contain_blur
+      - If aspect ratio is very different -> contain_plain
+      - Else -> cover
+    """
+    # Small check: if either dimension is < 50% of window dimension
+    size_ratio_w = sw / max(tw, 1)
+    size_ratio_h = sh / max(th, 1)
+    if size_ratio_w < small_threshold or size_ratio_h < small_threshold:
+        return "contain_blur"
+
+    # Aspect ratio outlier check
+    img_ar   = sw / max(sh, 1)
+    frame_ar = tw / max(th, 1)
+    ar_ratio = max(img_ar / frame_ar, frame_ar / img_ar)  # >=1
+    if ar_ratio >= weird_ar_ratio:
+        return "contain_plain"
+
+    return "cover"
+
 def prepare_photo_for_window(
     user_img: Image.Image,
     w: int,
     h: int,
     *,
-    hybrid_threshold: float = 0.4,   # if <70% of target and tiny, use blur pad
-    tiny_px: int = 400,
+    # thresholds: tweak to taste
+    small_threshold: float = 0.5,     # "≥50% smaller" rule
+    weird_ar_ratio: float = 1.8,      # how different AR must be to call it "weird"
     radius: int = 24,
-    pan: tuple[int, int] = (0, 0),   # NEW: crop pan passed through
+    pan: tuple[int, int] = (0, 0),
 ) -> Image.Image:
+    """
+    Prepares an RGBA image sized exactly (w,h) for the frame window using:
+      - 'cover' (crop) for normal/large images,
+      - 'contain_blur' for small images (>=50% smaller),
+      - 'contain_plain' for very weird aspect ratios.
+    """
     user_img = _exif(user_img).convert("RGB")
     sw, sh = user_img.size
-    use_blur_pad = (sw < w * hybrid_threshold or sh < h * hybrid_threshold) and min(sw, sh) < tiny_px
 
-    if not use_blur_pad:
-        # pan-aware cover fit
+    # Decide fit mode
+    mode = _choose_fit_mode(sw, sh, w, h, small_threshold=small_threshold, weird_ar_ratio=weird_ar_ratio)
+
+    if mode == "cover":
         photo = _cover_fit(user_img, w, h, pan=pan).convert("RGBA")
-    else:
-        # background: no pan (uniform blur)
+
+    elif mode == "contain_plain":
+        # Plain contain (no blur), centered on transparent canvas
+        fg = _contain_fit(user_img, w, h).convert("RGBA")
+        photo = _center_on_canvas(fg, w, h)
+
+    else:  # "contain_blur"
+        # Background: blurred cover (no pan so blur is uniform)
         bg = _cover_fit(user_img, w, h, pan=(0, 0)).convert("RGBA")
         bg = bg.filter(ImageFilter.GaussianBlur(28))
-        dark = Image.new("RGBA", (w, h), (0, 0, 0, 140))
-        bg = Image.alpha_composite(bg, dark)
+        # Slight darken to keep foreground readable
+        overlay = Image.new("RGBA", (w, h), (0, 0, 0, 140))
+        bg = Image.alpha_composite(bg, overlay)
 
-        # foreground: smaller, but respect pan so subject shifts
-        pad = 0.85
-        fw, fh = int(w * pad), int(h * pad)
-        fg = _cover_fit(user_img, fw, fh, pan=pan).convert("RGBA")
+        # Foreground: true contain (respecting subject, pan is OK here)
+        fg = _contain_fit(user_img, w, h).convert("RGBA")
+        # Optional: apply a subtle pan by shifting the center placement
+        # For contain, we simulate pan by nudging placement (clamped)
+        px, py = pan
+        ox = max(-w//4, min(w//4, px))   # gentle clamp
+        oy = max(-h//4, min(h//4, py))
+        photo = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        photo.alpha_composite(bg, (0, 0))
+        cx = (w - fg.width) // 2 + ox
+        cy = (h - fg.height) // 2 + oy
+        photo.alpha_composite(fg, (cx, cy))
 
-        photo = bg.copy()
-        ox, oy = (w - fw) // 2, (h - fh) // 2
-        photo.alpha_composite(fg, (ox, oy))
-
-    # inner shadow + rounded mask
+    # Inner shadow + rounded mask (unchanged)
     shadow_a = _inner_shadow((w, h), radius=26, strength=160)
     shadow_rgba = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     shadow_rgba.putalpha(shadow_a)
@@ -1707,12 +1791,15 @@ def compose_framed_card(frame_key: str, user_img: Image.Image, unveiled: bool = 
     dx, dy = meta.get("nudge", (0, 0))
     pan = meta.get("pan", (0, 0))
     radius = meta.get("radius", 0)
+    fit_override = meta.get("fit", "auto")
 
-    prepared = prepare_photo_for_window(user_img, w, h, radius=radius, pan=pan)
+    prepared = prepare_photo_for_window(
+        user_img, w, h, radius=radius, pan=pan, **_fit_kwargs(fit_override)
+    )
 
     out = Image.new("RGBA", frame.size, (0, 0, 0, 0))
-    out.alpha_composite(prepared, (x + dx, y + dy))  # photo behind
-    out.alpha_composite(frame, (0, 0))               # frame on top
+    out.alpha_composite(prepared, (x + dx, y + dy))
+    out.alpha_composite(frame, (0, 0))
     return out
 
 async def send_veil_message(
@@ -1739,8 +1826,11 @@ async def send_veil_message(
         dx, dy = meta.get("nudge", (0, 0))
         pan = meta.get("pan", (0, 0))
         radius = meta.get("radius", 0)
+        fit_override = meta.get("fit", "auto")   # <-- add
 
-        prepared_im = prepare_photo_for_window(user_img, w, h, radius=radius, pan=pan)
+        prepared_im = prepare_photo_for_window(
+            user_img, w, h, radius=radius, pan=pan, **_fit_kwargs(fit_override)   # <-- add
+        )
         buf = io.BytesIO()
         prepared_im.save(buf, format="PNG")
         prepared_png = buf.getvalue()
