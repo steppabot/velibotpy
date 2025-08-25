@@ -1595,6 +1595,14 @@ def _exif(im: Image.Image) -> Image.Image:
     except Exception:
         return im
 
+def _cover_crop_fractions(sw: int, sh: int, tw: int, th: int) -> tuple[float, float]:
+    scale = max(tw / sw, th / sh)
+    nw, nh = sw * scale, sh * scale
+    # fraction of each dimension that would be cropped away by cover
+    fx = max(0.0, (nw - tw) / nw)
+    fy = max(0.0, (nh - th) / nh)
+    return fx, fy
+
 def _cover_fit(img: Image.Image, tw: int, th: int, *, pan: tuple[int, int] = (0, 0)) -> Image.Image:
     """
     Scale to cover target box, then crop (no distortion).
@@ -1686,29 +1694,24 @@ def _choose_fit_mode(
 
 def prepare_photo_for_window(
     user_img: Image.Image,
-    w: int,
-    h: int,
+    w: int, h: int,
     *,
-    # thresholds: tweak to taste
-    small_threshold: float = 0.5,     # "≥50% smaller" rule
-    weird_ar_ratio: float = 1.8,      # how different AR must be to call it "weird"
+    small_threshold: float = 0.5,
+    weird_ar_ratio: float = 1.8,
+    max_crop_fraction: float = 0.20,   # 👈 NEW: if cover would crop >20%, use contain
     radius: int = 24,
     pan: tuple[int, int] = (0, 0),
 ) -> Image.Image:
-    """
-    Prepares an RGBA image sized exactly (w,h) for the frame window using:
-      - 'cover' (crop) for normal/large images,
-      - 'contain_blur' for small images (>=50% smaller),
-      - 'contain_plain' for very weird aspect ratios.
-    """
     user_img = _exif(user_img).convert("RGB")
     sw, sh = user_img.size
 
-    # Decide fit mode
     mode = _choose_fit_mode(sw, sh, w, h, small_threshold=small_threshold, weird_ar_ratio=weird_ar_ratio)
 
+    # NEW: crop-aware fallback
     if mode == "cover":
-        photo = _cover_fit(user_img, w, h, pan=pan).convert("RGBA")
+        fx, fy = _cover_crop_fractions(sw, sh, w, h)
+        if max(fx, fy) > max_crop_fraction:
+            mode = "contain_plain"
 
     elif mode == "contain_plain":
         # Plain contain (no blur), centered on transparent canvas
@@ -1766,12 +1769,17 @@ def _inner_shadow(size, radius=26, strength=160):
 
 def pick_frame_key_for_image(img: Image.Image) -> str:
     w, h = img.size
-    ar = w / max(h, 1)
-    if ar >= 1.15:  # fairly wide
-        return "landscape"
-    if ar <= 0.87:  # fairly tall
-        return "portrait"
-    return "square"
+    img_ar = w / max(h, 1)
+
+    best_key = None
+    best_diff = 1e9
+    for key, meta in VEIL_FRAMES.items():
+        _, _, tw, th = meta["window"]
+        frame_ar = tw / max(th, 1)
+        diff = abs(img_ar - frame_ar)
+        if diff < best_diff:
+            best_key, best_diff = key, diff
+    return best_key or "square"
 
 async def read_attachment_image(att: discord.Attachment) -> Image.Image | None:
     try:
