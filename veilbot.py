@@ -646,6 +646,50 @@ async def render_emojis(draw, image, tokens, x_start, y, font, emoji_size, emoji
     return x_start
     
 def build_wrapped_lines(tokens, font, box_width, draw, emoji_size=48, emoji_padding=4):
+    lines: list[list[str]] = []
+    current_line: list[str] = []
+    current_width = 0
+
+    def token_width(token: str) -> int:
+        if discord_emoji_pattern.fullmatch(token) or emoji.is_emoji(token.strip()):
+            return emoji_size + emoji_padding
+        return draw.textlength(token, font=font)
+
+    for token in tokens:
+        width = token_width(token)
+
+        if token.isspace() and not current_line:
+            continue
+
+        if width > box_width:
+            if current_line:
+                lines.append(current_line)
+                current_line = []
+                current_width = 0
+
+            current_part = ""
+            for char in token:
+                test_part = current_part + char
+                if draw.textlength(test_part, font=font) > box_width and current_part:
+                    lines.append([current_part])
+                    current_part = char
+                else:
+                    current_part = test_part
+            if current_part:
+                lines.append([current_part])
+            continue
+
+        if current_width + width > box_width:
+            lines.append(current_line)
+            current_line = [] if token.isspace() else [token]
+            current_width = 0 if token.isspace() else width
+        else:
+            current_line.append(token)
+            current_width += width
+
+    if current_line:
+        lines.append(current_line)
+
     return lines
 
 def calculate_line_y(line_tokens, font, base_y):
