@@ -1389,14 +1389,16 @@ def build_help_embed(guild: discord.Guild):
     is_elite = tier == "elite"
 
     # Header + basics
+    # Header + basics
     desc = (
         f"{maskemoji} **Veil — Anonymous Messages, With Receipts**\n\n"
         "**How it works**\n"
-        "• Use `/veil <message>` to post anonymously into your linked Veil channel\n"
+        "• Use `/veil <message>` to post text anonymously into your linked Veil channel\n"
+        "• Or upload an **image** with `/veil` instead of text\n"
         "• Others try to **Unveil** the author — correct guesses are tracked\n"
         "• Server subs unlock perks (coins, logs, leaderboards)\n\n"
         "**Message rules**\n"
-        "• Up to **200 visual characters**\n"
+        "• Either up to **200 visual characters** *or* **1 image attachment**\n"
         "• Keep it respectful; server rules still apply\n"
     )
 
@@ -1410,7 +1412,8 @@ def build_help_embed(guild: discord.Guild):
     embed.add_field(
         name="🙋 User Commands",
         value=(
-            "• `/veil <message>` — Send a message behind a veil\n"
+            "• `/veil <message>` — Send a text message behind a veil\n"
+            "• `/veil [image]` — Send an image behind a veil (no text)\n"
             "• `/user [@user]` — Your Veil stats (coins, unveils)\n"
             "• `/store` — Open the Veil Coin store"
         ),
