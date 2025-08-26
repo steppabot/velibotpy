@@ -1683,7 +1683,7 @@ def _choose_fit_mode(
     frame_ar = tw / max(th, 1)
     ar_ratio = max(img_ar / frame_ar, frame_ar / img_ar)  # >=1
     if ar_ratio >= weird_ar_ratio:
-        return "contain_plain"
+        return "contain_blur"
 
     return "cover"
 
