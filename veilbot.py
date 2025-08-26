@@ -360,7 +360,7 @@ VEIL_FRAMES = {
         "nudge": (0, 155),
         "pan": (0, -20),
         "radius": 28,
-        "fit": "auto",   # "auto" | "cover" | "contain" | "contain_plain" | "contain_blur"
+        "fit": "auto_chat",   # ← was "auto"
     },
     "portrait": {
         "file": "portraitframe.png",
@@ -370,7 +370,7 @@ VEIL_FRAMES = {
         "nudge": (0, 139),
         "pan": (0, -20),
         "radius": 28,
-        "fit": "auto",
+        "fit": "auto",        # keep default if you want
     },
     "square": {
         "file": "squareframe.png",
@@ -380,7 +380,7 @@ VEIL_FRAMES = {
         "nudge": (0, 139),
         "pan": (0, -20),
         "radius": 24,
-        "fit": "auto",
+        "fit": "auto_chat",   # ← was "auto"
     },
 }
 
@@ -1633,6 +1633,9 @@ def _fit_kwargs(fit: str | None) -> dict:
     """
     if not fit or fit == "auto":
         return {}
+    if fit == "auto_chat":                      # 👈 new profile
+        return dict(small_threshold=0.6,        # sooner call small → contain_blur
+                    weird_ar_ratio=1.3)         # treat milder AR gaps as "weird" → contain_plain
     if fit == "cover":
         return dict(small_threshold=0.0, weird_ar_ratio=999.0)
     if fit == "contain":
