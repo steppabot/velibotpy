@@ -358,7 +358,7 @@ VEIL_FRAMES = {
         "frame_size": (1318, 887),
         "window": (22, 8, 1235, 704),
         "nudge": (0, 155),
-        "pan": (0, -20),
+        "pan": (0, 0),
         "radius": 28,
         "fit": "auto_chat",   # ← was "auto"
     },
@@ -368,7 +368,7 @@ VEIL_FRAMES = {
         "frame_size": (900, 1300),
         "window": (22, 8, 818, 1119),
         "nudge": (0, 139),
-        "pan": (0, -20),
+        "pan": (0, 0),
         "radius": 28,
         "fit": "auto",        # keep default if you want
     },
@@ -378,7 +378,7 @@ VEIL_FRAMES = {
         "frame_size": (1150, 1185),
         "window": (22, 8, 1074, 1011),
         "nudge": (0, 139),
-        "pan": (0, -20),
+        "pan": (0, 0),
         "radius": 24,
         "fit": "auto_chat",   # ← was "auto"
     },
