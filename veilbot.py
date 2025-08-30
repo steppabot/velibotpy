@@ -244,10 +244,8 @@ APPLICATION_EMOJIS = {
 }
 
 intents = discord.Intents.default()
-intents.messages = True
 intents.guilds = True
-intents.members = True  # ✅ You need this!
-intents.message_content = True
+intents.members = True   # ✅ Approved and required for dropdown guesses
 
 conn, _ = init_db()
 
