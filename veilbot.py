@@ -166,6 +166,11 @@ def init_db():
         user_cols = {row[0] for row in cursor.fetchall()}
         if 'last_refill' not in user_cols:
             cursor.execute("ALTER TABLE veil_users ADD COLUMN last_refill TIMESTAMPTZ")
+        
+        # 🔹 NEW: track the last top.gg vote time
+        if 'topgg_last_vote_at' not in user_cols:
+            cursor.execute("ALTER TABLE veil_users ADD COLUMN topgg_last_vote_at TIMESTAMPTZ")
+        
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS veil_channels (
                 guild_id BIGINT PRIMARY KEY,
@@ -213,6 +218,18 @@ def init_db():
             ON coin_checkout_sessions (created_at)
         ''')
 
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS topgg_vote_sessions (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                guild_id BIGINT NOT NULL,
+                interaction_token TEXT NOT NULL,
+                application_id BIGINT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                used BOOLEAN NOT NULL DEFAULT FALSE
+            )
+        """)
+
         conn.commit()
         return conn, cursor
 
@@ -231,6 +248,7 @@ APPLICATION_EMOJIS = {
     "veilcoin": 1403948316429123675,
     "veilemoji": 1403948357222924410,
     "veilstore": 1404977462638805117,
+    "veiltopgg": 1412955891459690566,
     "1st": 1404977588161482783,
     "2nd": 1404977637171920927,
     "3rd": 1404977679152709804,
@@ -791,6 +809,47 @@ def get_latest_message_id(channel_id):
     except Exception as e:
         print(f"Error fetching latest message: {e}")
         return None
+
+def get_last_topgg_vote(user_id: int, guild_id: int):
+    with get_safe_cursor() as cur:
+        cur.execute("""
+            SELECT topgg_last_vote_at
+            FROM veil_users
+            WHERE user_id=%s AND guild_id=%s
+        """, (user_id, guild_id))
+        row = cur.fetchone()
+    return row[0] if row else None
+
+def human_left(dt: datetime, now: datetime) -> str:
+    # returns e.g. "4h 21m"
+    secs = int((dt - now).total_seconds())
+    h, r = divmod(max(secs,0), 3600)
+    m, _ = divmod(r, 60)
+    return (f"{h}h " if h else "") + (f"{m}m" if m or not h else "")
+
+def save_topgg_vote_session(interaction: discord.Interaction):
+    try:
+        with get_safe_cursor() as cur:
+            # keep it simple: one active session per user; mark old ones used
+            cur.execute("""
+                UPDATE topgg_vote_sessions
+                   SET used = TRUE
+                 WHERE user_id = %s AND used = FALSE
+            """, (interaction.user.id,))
+
+            cur.execute("""
+                INSERT INTO topgg_vote_sessions
+                    (user_id, guild_id, interaction_token, application_id)
+                VALUES (%s, %s, %s, %s)
+            """, (
+                interaction.user.id,
+                interaction.guild.id,
+                interaction.token,
+                interaction.client.application_id
+            ))
+            conn.commit()
+    except Exception as e:
+        print("❌ save_topgg_vote_session failed:", e)
 
 def set_latest_message_id(channel_id, message_id):
     try:
@@ -4351,6 +4410,64 @@ async def shards_cmd(inter: discord.Interaction):
     )
 
     await inter.response.send_message(header, ephemeral=True)
+
+@tree.command(name="vote", description="Earn 15 Veil Coins every 12 hours by voting on top.gg")
+async def vote_cmd(interaction: discord.Interaction):
+    veiltopgg = str(client.app_emojis.get("veiltopgg", "⭐"))
+    veilcoin  = str(client.app_emojis.get("veilcoin", "🪙"))
+
+    # Cooldown check (12h)
+    now = datetime.now(timezone.utc)
+    last = get_last_topgg_vote(interaction.user.id, interaction.guild.id)
+    if last:
+        next_ok = last + timedelta(hours=12)
+        if now < next_ok:
+            # Nice Discord relative timestamp and exact time left
+            next_unix = int(next_ok.timestamp())
+            left = human_left(next_ok, now)
+
+            url_btn = discord.ui.Button(
+                style=discord.ButtonStyle.link,
+                label="Open top.gg (cooldown active)",
+                url="https://top.gg/bot/1403948162955219025/vote",
+                emoji=client.app_emojis.get("veiltopgg")
+            )
+            view = discord.ui.View()
+            view.add_item(url_btn)
+
+            embed = discord.Embed(
+                title=f"{veiltopgg} You’ve already voted",
+                description=(
+                    f"You can vote again **<t:{next_unix}:R>** "
+                    f"(~{left}).\n\nVoting rewards **+15 {veilcoin}** each time."
+                ),
+                color=0xeeac00
+            )
+            return await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    # If we’re here, user can vote now → record a pending session to patch later
+    save_topgg_vote_session(interaction)
+
+    url_btn = discord.ui.Button(
+        style=discord.ButtonStyle.link,
+        label="Vote on top.gg",
+        url="https://top.gg/bot/1403948162955219025/vote",
+        emoji=client.app_emojis.get("veiltopgg")
+    )
+    view = discord.ui.View()
+    view.add_item(url_btn)
+
+    embed = discord.Embed(
+        title=f"{veiltopgg} Vote for Veil on top.gg",
+        description=(
+            f"Click **Vote on top.gg** below. Once top.gg pings us, "
+            f"**+15 {veilcoin} Veil Coins** will be added to your balance.\n\n"
+            "You can vote **every 12 hours**.\n\n"
+            "_This message will update automatically after your vote is received._"
+        ),
+        color=0xeeac00
+    )
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 @client.event
 async def on_message(message: discord.Message):
