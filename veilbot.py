@@ -828,26 +828,34 @@ def human_left(dt: datetime, now: datetime) -> str:
     return (f"{h}h " if h else "") + (f"{m}m" if m or not h else "")
 
 def save_topgg_vote_session(interaction: discord.Interaction):
+    # Must be run in a server so we know which (user_id, guild_id) row to credit
+    gid = interaction.guild_id
+    if gid is None:
+        # You can alternatively send a friendly ephemeral reply instead of raising
+        raise RuntimeError("Run /vote in a server (not DMs).")
+
     try:
-        with get_safe_cursor() as cur:
-            # keep it simple: one active session per user; mark old ones used
+        with get_db_conn() as conn, conn.cursor() as cur:
+            # keep it simple: one active session per user; mark any old ones used
             cur.execute("""
                 UPDATE topgg_vote_sessions
                    SET used = TRUE
                  WHERE user_id = %s AND used = FALSE
             """, (interaction.user.id,))
 
+            # store a fresh session the webhook can match later
             cur.execute("""
                 INSERT INTO topgg_vote_sessions
-                    (user_id, guild_id, interaction_token, application_id)
-                VALUES (%s, %s, %s, %s)
+                    (user_id, guild_id, interaction_token, application_id, created_at, used)
+                VALUES (%s, %s, %s, %s, NOW(), FALSE)
             """, (
                 interaction.user.id,
-                interaction.guild.id,
+                gid,
                 interaction.token,
-                interaction.client.application_id
+                interaction.client.application_id  # or interaction.application_id
             ))
-            conn.commit()
+
+        print(f"[topgg] saved vote session user={interaction.user.id} guild={gid}")
     except Exception as e:
         print("❌ save_topgg_vote_session failed:", e)
 
