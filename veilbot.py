@@ -4468,7 +4468,7 @@ async def vote_cmd(interaction: discord.Interaction):
     embed = discord.Embed(
         title=f"{veiltopgg} Vote for Veil on top.gg",
         description=(
-            f"Click **Vote on top.gg** below. Once top.gg pings us, "
+            f"Click **Vote on top.gg** below.\mOnce top.gg pings us, "
             f"**+15 {veilcoin} Veil Coins** will be added to your balance.\n\n"
             "You can vote **every 12 hours**.\n\n"
             "_This message will update automatically after your vote is received._"
