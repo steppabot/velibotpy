@@ -827,7 +827,7 @@ def human_left(dt: datetime, now: datetime) -> str:
     m, _ = divmod(r, 60)
     return (f"{h}h " if h else "") + (f"{m}m" if m or not h else "")
 
-def save_topgg_vote_session(interaction: discord.Interaction):
+def save_topgg_vote_session(interaction: discord.Interaction) -> int | None:
     # Must be run in a server so we know which (user_id, guild_id) row to credit
     gid = interaction.guild_id
     if gid is None:
@@ -835,29 +835,35 @@ def save_topgg_vote_session(interaction: discord.Interaction):
         raise RuntimeError("Run /vote in a server (not DMs).")
 
     try:
-        with get_db_conn() as conn, conn.cursor() as cur:
-            # keep it simple: one active session per user; mark any old ones used
+        with get_safe_cursor() as cur:
+            # mark any old, unused sessions for this user
             cur.execute("""
                 UPDATE topgg_vote_sessions
                    SET used = TRUE
                  WHERE user_id = %s AND used = FALSE
             """, (interaction.user.id,))
 
-            # store a fresh session the webhook can match later
+            # insert fresh session and return its id
             cur.execute("""
                 INSERT INTO topgg_vote_sessions
-                    (user_id, guild_id, interaction_token, application_id, created_at, used)
-                VALUES (%s, %s, %s, %s, NOW(), FALSE)
+                    (user_id, guild_id, interaction_token, application_id)
+                VALUES (%s, %s, %s, %s)
+             RETURNING id
             """, (
                 interaction.user.id,
                 gid,
                 interaction.token,
-                interaction.client.application_id  # or interaction.application_id
+                interaction.client.application_id
             ))
+            new_id_row = cur.fetchone()
+            new_id = new_id_row[0] if new_id_row else None
 
-        print(f"[topgg] saved vote session user={interaction.user.id} guild={gid}")
+        print(f"[topgg] saved vote session id={new_id} user={interaction.user.id} guild={gid}")
+        return new_id
+
     except Exception as e:
         print("❌ save_topgg_vote_session failed:", e)
+        return None
 
 def set_latest_message_id(channel_id, message_id):
     try:
