@@ -287,6 +287,14 @@ async def on_shard_disconnect(shard_id: int):
 async def on_ready():
     print(f"logged in as {client.user} with {client.shard_count} shard(s)")
 
+    # Skins (9-slice) — load once
+    try:
+        client.skins = load_skin_packs(SKINS_ROOT)
+        print(f"✅ Loaded skins: {', '.join(client.skins.keys()) or '—'}")
+    except Exception as e:
+        client.skins = {}
+        print(f"❌ Failed to load skins: {e}")
+
     # Load emojis
     client.app_emojis = {
         name: discord.PartialEmoji(name=name, id=eid)
@@ -306,8 +314,6 @@ async def on_ready():
     client.add_view(StoreView())
     await hydrate_latest_views()
 
-
-
 OWNER_IDS = {568583831985061918}  # <-- your Discord user ID(s)
 SUPPORT_SERVER_ID = 1394932709394087946  # Your support server ID
 SUPPORT_CHANNEL_ID = 1399973286649008158  # The channel where webhook posts
@@ -322,7 +328,6 @@ COIN_RE = re.compile(
 
 emoji_patternz = re.compile(r"<a?:([a-zA-Z0-9_]+):(\d+)>")  # matches <:name:id> and <a:name:id>
 emoji_sequence_pattern = regex.compile(r'\X', regex.UNICODE)
-
 
 def fmt(n) -> str:
     try: return f"{int(n):,}"
@@ -367,6 +372,7 @@ ARABIC_RE = re.compile(r'[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]')
 CJK_RE = re.compile(r'[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]')
 DEVANAGARI_RE = re.compile(r'[\u0900-\u097F]')
 MENTION_RE = re.compile(r"<(@!?|@&|#)(\d+)>")
+SKINS_ROOT = os.path.join(BASE_DIR, "skins")  # skins/<pack>/{veil,unveil}/...
 VEIL_FRAMES = {
     "landscape": {
         "file": "landscapeframe.png",
@@ -400,12 +406,46 @@ VEIL_FRAMES = {
     },
 }
 
+# small bleed so the photo tucks under the frame
+INNER_BLEED_PX = 2
+
+# per-corner offsets (x, y). +x → right, +y → down
+CORNER_OFFSETS = {
+    "tl": (-1,  0),
+    "tr": (30, -50),  # tuned so the mask sits perfectly
+    "br": ( 1,  0),
+    "bl": (-1,  0),
+}
+
+# per-edge nudges (x, y)
+EDGE_NUDGE = {
+    "top":    (0, 1),   # bring the top edge down 1px so it aligns with corners
+    "right":  (0, 0),
+    "bottom": (0, 0),
+    "left":   (0, 0),
+}
+
+# force extra transparent canvas around overlay (L, T, R, B)
+# give the mask more right-side space so it never crops
+EXTRA_CANVAS_PADDING = (0, 35, 40, 0)
+
+# window min before we switch to padded/blurred background
+MIN_WINDOW_WIDTH  = 500
+MIN_WINDOW_HEIGHT = 200
+
+SMALL_BG_BLUR    = 28
+SMALL_BG_DARKEN  = 140   # 0..255 alpha over blur
+MAX_OUTER_LONG   = 2048  # safety clamp
+
 FONT_MAP = {
     "latin": "ariblk.ttf",        # English + Latin
     "arabic": "arabic2.ttf",       # NotoNaskhArabic
     "cjk": "chinese3.ttf",         # NotoSansSC/TC
     "devanagari": "indian.ttf",   # NotoSansDevanagari
 }
+
+MAX_SRC_LONG = 1600  # pick your comfort number
+
 
 def _safe_display_name(member):
     return member.display_name if member else None
@@ -1660,175 +1700,365 @@ async def hydrate_latest_views():
         except discord.HTTPException as e:
             print(f"⚠️ Failed to restore latest veil {latest_id}: {e}")
 
+# ────────────────────────── 9-SLICE SKINS ──────────────────────────
+class NineSliceSkin:
+    """
+    9-slice frame where edges stop exactly at the corner's opaque pixels.
+    Corners may be larger than thickness (branding/mask). Supports per-corner
+    offsets (CORNER_OFFSETS) and forced canvas padding (EXTRA_CANVAS_PADDING).
+    Returns (overlay, (extra_left, extra_top, extra_right, extra_bottom)).
+    """
+    def __init__(self, folder: str):
+        self.folder = folder
+        def load(name): return Image.open(os.path.join(folder, name)).convert("RGBA")
+
+        required = [
+            "corner_tl.png","corner_tr.png","corner_br.png","corner_bl.png",
+            "edge_top.png","edge_right.png","edge_bottom.png","edge_left.png"
+        ]
+        missing = [p for p in required if not os.path.isfile(os.path.join(folder, p))]
+        if missing:
+            raise FileNotFoundError(f"Missing in {folder}: {', '.join(missing)}")
+
+        # pieces
+        self.corner_tl = load("corner_tl.png")
+        self.corner_tr = load("corner_tr.png")
+        self.corner_br = load("corner_br.png")
+        self.corner_bl = load("corner_bl.png")
+        self.edge_top  = load("edge_top.png")
+        self.edge_right= load("edge_right.png")
+        self.edge_bottom=load("edge_bottom.png")
+        self.edge_left = load("edge_left.png")
+
+        # thickness from edges
+        self.th_top    = self.edge_top.height
+        self.th_bottom = self.edge_bottom.height
+        self.th_left   = self.edge_left.width
+        self.th_right  = self.edge_right.width
+
+        # guard: corners must at least cover edge thickness in their touching bands
+        for name, im, need_w, need_h in [
+            ("corner_tl", self.corner_tl, self.th_left,  self.th_top),
+            ("corner_tr", self.corner_tr, self.th_right, self.th_top),
+            ("corner_bl", self.corner_bl, self.th_left,  self.th_bottom),
+            ("corner_br", self.corner_br, self.th_right, self.th_bottom),
+        ]:
+            if im.width < need_w or im.height < need_h:
+                raise ValueError(f"{name} smaller than required thickness ({need_w}×{need_h}) in {folder}")
+
+        # ---- scan opaque spans in corner bands (alpha>=8 considered opaque) ----
+        T = 8
+        def top_band_first(img, band_h):
+            a = img.split()[-1]
+            for x in range(img.width):
+                for y in range(min(band_h, img.height)):
+                    if a.getpixel((x, y)) >= T: return x
+            return img.width
+        def top_band_last(img, band_h):
+            a = img.split()[-1]
+            for x in range(img.width-1, -1, -1):
+                for y in range(min(band_h, img.height)):
+                    if a.getpixel((x, y)) >= T: return x
+            return -1
+        def bottom_band_first(img, band_h):
+            a = img.split()[-1]; y0 = max(0, img.height - band_h)
+            for x in range(img.width):
+                for y in range(y0, img.height):
+                    if a.getpixel((x, y)) >= T: return x
+            return img.width
+        def bottom_band_last(img, band_h):
+            a = img.split()[-1]; y0 = max(0, img.height - band_h)
+            for x in range(img.width-1, -1, -1):
+                for y in range(y0, img.height):
+                    if a.getpixel((x, y)) >= T: return x
+            return -1
+        def left_band_first(img, band_w):
+            a = img.split()[-1]
+            for y in range(img.height):
+                for x in range(min(band_w, img.width)):
+                    if a.getpixel((x, y)) >= T: return y
+            return img.height
+        def left_band_last(img, band_w):
+            a = img.split()[-1]
+            for y in range(img.height-1, -1, -1):
+                for x in range(min(band_w, img.width)):
+                    if a.getpixel((x, y)) >= T: return y
+            return -1
+        def right_band_first(img, band_w):
+            a = img.split()[-1]; x0 = max(0, img.width - band_w)
+            for y in range(img.height):
+                for x in range(x0, img.width):
+                    if a.getpixel((x, y)) >= T: return y
+            return img.height
+        def right_band_last(img, band_w):
+            a = img.split()[-1]; x0 = max(0, img.width - band_w)
+            for y in range(img.height-1, -1, -1):
+                for x in range(x0, img.width):
+                    if a.getpixel((x, y)) >= T: return y
+            return -1
+
+        self._tl_top_first = top_band_first(self.corner_tl, self.th_top)
+        self._tl_top_last  = top_band_last (self.corner_tl, self.th_top)
+        self._tr_top_first = top_band_first(self.corner_tr, self.th_top)
+        self._tr_top_last  = top_band_last (self.corner_tr, self.th_top)
+
+        self._bl_bot_first = bottom_band_first(self.corner_bl, self.th_bottom)
+        self._bl_bot_last  = bottom_band_last (self.corner_bl, self.th_bottom)
+        self._br_bot_first = bottom_band_first(self.corner_br, self.th_bottom)
+        self._br_bot_last  = bottom_band_last (self.corner_br, self.th_bottom)
+
+        self._tl_left_last  = left_band_last (self.corner_tl, self.th_left)
+        self._bl_left_first = left_band_first(self.corner_bl, self.th_left)
+        self._tr_right_last = right_band_last (self.corner_tr, self.th_right)
+        self._br_right_first= right_band_first(self.corner_br, self.th_right)
+
+    @property
+    def paddings(self) -> tuple[int,int,int,int]:
+        return (self.th_left, self.th_top, self.th_right, self.th_bottom)
+
+    def required_window_min(self) -> tuple[int, int]:
+        """
+        Conservative lower bounds for the inner window so top/bottom center spans don't go negative
+        and left/right edges have room between the opaque tails.
+        """
+        # horizontal: leave at least 8px between TL's last opaque col and TR's first opaque col
+        gap_x = 8
+        min_w = (self.corner_tl.width - self._tl_top_last - 1) + (self.corner_tr.width - self._tr_top_first) + gap_x
+        # vertical: same idea for left/right
+        gap_y = 8
+        min_h = (self.corner_tl.height - self._tl_left_last - 1) + (self.corner_bl.height - self._bl_left_first) + gap_y
+        # never smaller than the straight edge thicknesses
+        min_w = max(min_w, self.th_left + self.th_right + 16)
+        min_h = max(min_h, self.th_top  + self.th_bottom + 16)
+        return (min_w, min_h)
+
+    def build_overlay(self, window_w: int, window_h: int) -> tuple[Image.Image, tuple[int,int,int,int]]:
+        W = self.th_left + window_w + self.th_right
+        H = self.th_top  + window_h + self.th_bottom
+
+        # corner positions with offsets
+        tl_ox, tl_oy = CORNER_OFFSETS.get("tl", (0,0))
+        tr_ox, tr_oy = CORNER_OFFSETS.get("tr", (0,0))
+        br_ox, br_oy = CORNER_OFFSETS.get("br", (0,0))
+        bl_ox, bl_oy = CORNER_OFFSETS.get("bl", (0,0))
+
+        tl_pos = (0 + tl_ox, 0 + tl_oy)
+        tr_pos = (W - self.corner_tr.width + tr_ox, 0 + tr_oy)
+        bl_pos = (0 + bl_ox, H - self.corner_bl.height + bl_oy)
+        br_pos = (W - self.corner_br.width + br_ox, H - self.corner_br.height + br_oy)
+
+        # overhang + forced padding
+        min_x = min(0, tl_pos[0], tr_pos[0], bl_pos[0], br_pos[0])
+        min_y = min(0, tl_pos[1], tr_pos[1], bl_pos[1], br_pos[1])
+        max_x = max(W,
+                    tl_pos[0] + self.corner_tl.width,
+                    tr_pos[0] + self.corner_tr.width,
+                    bl_pos[0] + self.corner_bl.width,
+                    br_pos[0] + self.corner_br.width)
+        max_y = max(H,
+                    tl_pos[1] + self.corner_tl.height,
+                    tr_pos[1] + self.corner_tr.height,
+                    bl_pos[1] + self.corner_bl.height,
+                    br_pos[1] + self.corner_br.height)
+
+        over_l = max(0, -min_x)
+        over_t = max(0, -min_y)
+        over_r = max(0,  max_x - W)
+        over_b = max(0,  max_y - H)
+
+        pad_l, pad_t, pad_r, pad_b = EXTRA_CANVAS_PADDING
+        extra_left   = max(over_l, pad_l)
+        extra_top    = max(over_t, pad_t)
+        extra_right  = max(over_r, pad_r)
+        extra_bottom = max(over_b, pad_b)
+
+        new_W = W + extra_left + extra_right
+        new_H = H + extra_top  + extra_bottom
+        out = Image.new("RGBA", (new_W, new_H), (0, 0, 0, 0))
+        sx, sy = extra_left, extra_top
+
+        # helpers
+        def repeat_h(tile: Image.Image, x0: int, y: int, length: int):
+            if length <= 0: return
+            x = x0; w = tile.width
+            while x < x0 + length:
+                sw = min(w, x0 + length - x)
+                out.alpha_composite(tile if sw == w else tile.crop((0, 0, sw, tile.height)), (x + sx, y + sy))
+                x += sw
+
+        def repeat_v(tile: Image.Image, x: int, y0: int, length: int):
+            if length <= 0: return
+            y = y0; h = tile.height
+            while y < y0 + length:
+                sh = min(h, y0 + length - y)
+                out.alpha_composite(tile if sh == h else tile.crop((0, 0, tile.width, sh)), (x + sx, y + sy))
+                y += sh
+
+        left_lim  = self.th_left
+        right_lim = W - self.th_right
+
+        # apply per-edge nudges
+        tx, ty = EDGE_NUDGE.get("top",    (0, 0))
+        bx, by = EDGE_NUDGE.get("bottom", (0, 0))
+        lx, ly = EDGE_NUDGE.get("left",   (0, 0))
+        rx, ry = EDGE_NUDGE.get("right",  (0, 0))
+
+        top_row   = 0 + ty
+        bot_row   = H - self.th_bottom + by
+        left_col  = 0 + lx
+        right_col = W - self.th_right + rx
+
+        # ---------- TOP EDGE: three segments (left, center, right) ----------
+        tl_first_g = tl_pos[0] + self._tl_top_first
+        tl_last_g  = tl_pos[0] + self._tl_top_last + 1
+        tr_first_g = tr_pos[0] + self._tr_top_first
+        tr_last_g  = tr_pos[0] + self._tr_top_last + 1
+
+        repeat_h(self.edge_top, max(left_lim, left_lim),  top_row, max(0, min(right_lim, tl_first_g) - left_lim))
+        repeat_h(self.edge_top, max(left_lim, tl_last_g), top_row, max(0, min(right_lim, tr_first_g) - max(left_lim, tl_last_g)))
+        repeat_h(self.edge_top, max(left_lim, tr_last_g), top_row, max(0, right_lim - max(left_lim, tr_last_g)))
+
+        # ---------- BOTTOM EDGE ----------
+        bl_first_g = bl_pos[0] + self._bl_bot_first
+        bl_last_g  = bl_pos[0] + self._bl_bot_last + 1
+        br_first_g = br_pos[0] + self._br_bot_first
+        br_last_g  = br_pos[0] + self._br_bot_last + 1
+
+        repeat_h(self.edge_bottom, max(left_lim, left_lim), bot_row, max(0, min(right_lim, bl_first_g) - left_lim))
+        repeat_h(self.edge_bottom, max(left_lim, bl_last_g), bot_row, max(0, min(right_lim, br_first_g) - max(left_lim, bl_last_g)))
+        repeat_h(self.edge_bottom, max(left_lim, br_last_g), bot_row, max(0, right_lim - max(left_lim, br_last_g)))
+
+        # ---------- LEFT EDGE ----------
+        tl_last_y = tl_pos[1] + self._tl_left_last + 1
+        bl_first_y= bl_pos[1] + self._bl_left_first
+        repeat_v(self.edge_left, left_col, max(self.th_top, tl_last_y), max(0, min(H - self.th_bottom, bl_first_y) - max(self.th_top, tl_last_y)))
+
+        # ---------- RIGHT EDGE ----------
+        tr_last_y = tr_pos[1] + self._tr_right_last + 1
+        br_first_y= br_pos[1] + self._br_right_first
+        repeat_v(self.edge_right, right_col, max(self.th_top, tr_last_y), max(0, min(H - self.th_bottom, br_first_y) - max(self.th_top, tr_last_y)))
+
+        # corners on top
+        out.alpha_composite(self.corner_tl, (tl_pos[0] + sx, tl_pos[1] + sy))
+        out.alpha_composite(self.corner_tr, (tr_pos[0] + sx, tr_pos[1] + sy))
+        out.alpha_composite(self.corner_bl, (bl_pos[0] + sx, bl_pos[1] + sy))
+        out.alpha_composite(self.corner_br, (br_pos[0] + sx, br_pos[1] + sy))
+
+        return out, (extra_left, extra_top, extra_right, extra_bottom)
+
+class SkinPack:
+    def __init__(self, name: str, veil_dir: str, unveil_dir: str | None):
+        self.name = name
+        self.veil = NineSliceSkin(veil_dir)
+        self.unveil = NineSliceSkin(unveil_dir) if unveil_dir else None
+
+def load_skin_packs(root: str) -> dict[str, SkinPack]:
+    packs = {}
+    if not os.path.isdir(root):
+        return packs
+    for name in sorted(os.listdir(root)):
+        base = os.path.join(root, name)
+        if not os.path.isdir(base): 
+            continue
+        veil_dir   = os.path.join(base, "veil")
+        unveil_dir = os.path.join(base, "unveil")
+        if os.path.isdir(veil_dir):
+            packs[name] = SkinPack(name, veil_dir, unveil_dir if os.path.isdir(unveil_dir) else None)
+    return packs
+
+def compose_around_photo(user_img: Image.Image, skin: NineSliceSkin) -> Image.Image:
+    """
+    Frame is built around the (possibly padded) photo window.
+    - If the photo would be very small, we PAD the window to MIN_WINDOW_WIDTH/HEIGHT
+      (keep photo size; fill the rest with blurred/darkened cover).
+    - We also respect the skin's required_window_min() so corners never collide.
+    """
+    user_img = _downscale(_exif(user_img).convert("RGBA"))
+
+    # 1) start with window = photo size (we may pad it larger)
+    win_w, win_h = user_img.width, user_img.height
+
+    # 2) pad small images: make the inner window at least MIN_WINDOW_W/H
+    target_w = max(win_w, MIN_WINDOW_WIDTH)
+    target_h = max(win_h, MIN_WINDOW_HEIGHT)
+
+    # ensure the window is wide/tall enough that corners don't collide
+    req_w, req_h = skin.required_window_min()
+    target_w = max(target_w, req_w)
+    target_h = max(target_h, req_h)
+
+    # 3) build the overlay for the (maybe larger) window
+    overlay, (ex_l, ex_t, ex_r, ex_b) = skin.build_overlay(target_w, target_h)
+
+    # 4) make the window content (photo centered on a blurred/darkened cover if padded)
+    b = INNER_BLEED_PX
+    if (target_w, target_h) == (win_w, win_h):
+        # no pad: just add bleed
+        photo_plane = user_img.resize((win_w + 2*b, win_h + 2*b), Image.LANCZOS)
+    else:
+        # padded: make blurred/darkened cover
+        sw, sh = user_img.size
+        scale = max(target_w / max(1, sw), target_h / max(1, sh))
+        bg = user_img.convert("RGB").resize(
+            (max(1, int(sw * scale)), max(1, int(sh * scale))),
+            Image.LANCZOS
+        )
+        cx, cy = bg.width // 2, bg.height // 2
+        left = max(0, cx - target_w // 2); top = max(0, cy - target_h // 2)
+        bg = bg.crop((left, top, left + target_w, top + target_h)).convert("RGBA")
+        bg = bg.filter(ImageFilter.GaussianBlur(SMALL_BG_BLUR))
+        if SMALL_BG_DARKEN:
+            dark = Image.new("RGBA", (target_w, target_h), (0, 0, 0, SMALL_BG_DARKEN))
+            bg = Image.alpha_composite(bg, dark)
+
+        plane = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
+        ox = (target_w - win_w) // 2
+        oy = (target_h - win_h) // 2
+        plane.alpha_composite(bg, (0, 0))
+        plane.alpha_composite(user_img, (ox, oy))
+
+        # add bleed
+        photo_plane = Image.new("RGBA", (target_w + 2*b, target_h + 2*b), (0, 0, 0, 0))
+        photo_plane.alpha_composite(plane, (b, b))
+
+    # 5) inner shadow on the whole (window + bleed)
+    shadow_a = _inner_shadow((photo_plane.width, photo_plane.height), radius=26, strength=160)
+    shadow_rgba = Image.new("RGBA", photo_plane.size, (0, 0, 0, 0))
+    shadow_rgba.putalpha(shadow_a)
+    photo_plane = Image.alpha_composite(shadow_rgba, photo_plane)
+
+    # 6) composite onto outer canvas (edges thickness + any extra margins from corners)
+    left, top, right, bottom = skin.paddings
+    out_w = left + target_w + right + ex_l + ex_r
+    out_h = top  + target_h + bottom + ex_t + ex_b
+
+    out = Image.new("RGBA", (out_w, out_h), (0, 0, 0, 0))
+    out.alpha_composite(photo_plane, (ex_l + left - b, ex_t + top - b))
+    out.alpha_composite(overlay, (0, 0))
+
+    # 7) final safety clamp
+    long_side = max(out_w, out_h)
+    if long_side > MAX_OUTER_LONG:
+        s = MAX_OUTER_LONG / long_side
+        new_size = (max(1, int(out_w * s)), max(1, int(out_h * s)))
+        out = out.resize(new_size, Image.LANCZOS)
+
+    return out
+# ──────────────────────────────────────────────────────────────────
+
 def _exif(im: Image.Image) -> Image.Image:
     try:
         return ImageOps.exif_transpose(im)
     except Exception:
         return im
 
-def _cover_fit(img: Image.Image, tw: int, th: int, *, pan: tuple[int, int] = (0, 0)) -> Image.Image:
-    """
-    Scale to cover target box, then crop (no distortion).
-    pan=(px, py) offsets the crop AFTER scaling, in output pixels.
-      +px -> crop moves right (content shifts left)
-      +py -> crop moves down  (content shifts up)
-    """
-    sw, sh = img.size
-    scale = max(tw / sw, th / sh)
-    nw, nh = int(sw * scale + 0.5), int(sh * scale + 0.5)
-    img = img.resize((nw, nh), Image.LANCZOS)
-
-    # centered crop + pan
-    cx, cy = nw // 2, nh // 2
-    half_w, half_h = tw // 2, th // 2
-    px, py = pan
-
-    left   = cx - half_w + px
-    top    = cy - half_h + py
-    # clamp to bounds
-    left   = max(0, min(left, nw - tw))
-    top    = max(0, min(top, nh - th))
-    right  = left + tw
-    bottom = top + th
-
-    return img.crop((left, top, right, bottom))
-
-def _fit_kwargs(fit: str | None) -> dict:
-    """
-    Translate a frame's `fit` override into prepare_photo_for_window kwargs.
-    - "cover"          -> always cover
-    - "contain"        -> always contain + blur
-    - "contain_plain"  -> always plain contain (no blur)
-    - "contain_blur"   -> always contain + blur
-    - "auto"/None      -> let the auto rules decide
-    """
-    if not fit or fit == "auto":
-        return {}
-    if fit == "auto_chat":                      # 👈 new profile
-        return dict(small_threshold=0.6,        # sooner call small → contain_blur
-                    weird_ar_ratio=1.3)         # treat milder AR gaps as "weird" → contain_plain
-    if fit == "cover":
-        return dict(small_threshold=0.0, weird_ar_ratio=999.0)
-    if fit == "contain":
-        return dict(small_threshold=1.1, weird_ar_ratio=999.0)  # force the "small" branch -> blurred contain
-    if fit == "contain_blur":
-        return dict(small_threshold=1.1, weird_ar_ratio=0.0)    # also guarantees blurred contain
-    if fit == "contain_plain":
-        return dict(small_threshold=0.0, weird_ar_ratio=0.0)    # skip "small", trigger "weird" -> plain contain
-    return {}
-
-def _contain_fit(img: Image.Image, tw: int, th: int) -> Image.Image:
-    """Scale to fit entirely inside target box (letterbox/pillarbox)."""
-    sw, sh = img.size
-    scale = min(tw / sw, th / sh)
-    nw, nh = max(1, int(sw * scale + 0.5)), max(1, int(sh * scale + 0.5))
-    return img.resize((nw, nh), Image.LANCZOS)
-
-def _center_on_canvas(fg: Image.Image, tw: int, th: int) -> Image.Image:
-    """Center-place fg on an RGBA canvas of (tw, th)."""
-    canvas = Image.new("RGBA", (tw, th), (0, 0, 0, 0))
-    ox = (tw - fg.width) // 2
-    oy = (th - fg.height) // 2
-    canvas.alpha_composite(fg.convert("RGBA"), (ox, oy))
-    return canvas
-
-def _choose_fit_mode(
-    sw: int, sh: int, tw: int, th: int,
-    *, small_threshold: float = 0.5, weird_ar_ratio: float = 1.8
-) -> str:
-    """
-    Returns one of: "cover", "contain_blur", "contain_plain".
-    Rules:
-      - If image is 'small' (any side < 50% of window) -> contain_blur
-      - If aspect ratio is very different -> contain_plain
-      - Else -> cover
-    """
-    # Small check: if either dimension is < 50% of window dimension
-    size_ratio_w = sw / max(tw, 1)
-    size_ratio_h = sh / max(th, 1)
-    if size_ratio_w < small_threshold or size_ratio_h < small_threshold:
-        return "contain_blur"
-
-    # Aspect ratio outlier check
-    img_ar   = sw / max(sh, 1)
-    frame_ar = tw / max(th, 1)
-    ar_ratio = max(img_ar / frame_ar, frame_ar / img_ar)  # >=1
-    if ar_ratio >= weird_ar_ratio:
-        return "contain_blur"
-
-    return "cover"
-
-def prepare_photo_for_window(
-    user_img: Image.Image,
-    w: int,
-    h: int,
-    *,
-    # thresholds: tweak to taste
-    small_threshold: float = 0.5,     # "≥50% smaller" rule
-    weird_ar_ratio: float = 1.8,      # how different AR must be to call it "weird"
-    radius: int = 24,
-    pan: tuple[int, int] = (0, 0),
-) -> Image.Image:
-    """
-    Prepares an RGBA image sized exactly (w,h) for the frame window using:
-      - 'cover' (crop) for normal/large images,
-      - 'contain_blur' for small images (>=50% smaller),
-      - 'contain_plain' for very weird aspect ratios.
-    """
-    user_img = _exif(user_img).convert("RGB")
-    sw, sh = user_img.size
-
-    # Decide fit mode
-    mode = _choose_fit_mode(sw, sh, w, h, small_threshold=small_threshold, weird_ar_ratio=weird_ar_ratio)
-
-    if mode == "cover":
-        photo = _cover_fit(user_img, w, h, pan=pan).convert("RGBA")
-
-    elif mode == "contain_plain":
-        # Plain contain (no blur), centered on transparent canvas
-        fg = _contain_fit(user_img, w, h).convert("RGBA")
-        photo = _center_on_canvas(fg, w, h)
-
-    else:  # "contain_blur"
-        # Background: blurred cover (no pan so blur is uniform)
-        bg = _cover_fit(user_img, w, h, pan=(0, 0)).convert("RGBA")
-        bg = bg.filter(ImageFilter.GaussianBlur(28))
-        # Slight darken to keep foreground readable
-        overlay = Image.new("RGBA", (w, h), (0, 0, 0, 140))
-        bg = Image.alpha_composite(bg, overlay)
-
-        # Foreground: true contain (respecting subject, pan is OK here)
-        fg = _contain_fit(user_img, w, h).convert("RGBA")
-        # Optional: apply a subtle pan by shifting the center placement
-        # For contain, we simulate pan by nudging placement (clamped)
-        px, py = pan
-        ox = max(-w//4, min(w//4, px))   # gentle clamp
-        oy = max(-h//4, min(h//4, py))
-        photo = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        photo.alpha_composite(bg, (0, 0))
-        cx = (w - fg.width) // 2 + ox
-        cy = (h - fg.height) // 2 + oy
-        photo.alpha_composite(fg, (cx, cy))
-
-    # Inner shadow + rounded mask (unchanged)
-    shadow_a = _inner_shadow((w, h), radius=26, strength=160)
-    shadow_rgba = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    shadow_rgba.putalpha(shadow_a)
-    photo = Image.alpha_composite(shadow_rgba, photo)
-
-    if radius:
-        mask = _rounded_mask(w, h, radius)
-        clipped = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        clipped.paste(photo, (0, 0), mask)
-        return clipped
-
-    return photo
-
-def _rounded_mask(w: int, h: int, r: int) -> Image.Image:
-    m = Image.new("L", (w, h), 0)
-    d = ImageDraw.Draw(m)
-    d.rounded_rectangle((0, 0, w, h), r, fill=255)
-    return m
+def _downscale(im: Image.Image, max_long=MAX_SRC_LONG) -> Image.Image:
+    w, h = im.size
+    long_side = max(w, h)
+    if long_side <= max_long:
+        return im
+    s = max_long / long_side
+    return im.resize((max(1,int(w*s)), max(1,int(h*s))), Image.LANCZOS)
 
 def _inner_shadow(size, radius=26, strength=160):
     w, h = size
@@ -1837,15 +2067,6 @@ def _inner_shadow(size, radius=26, strength=160):
     inset = max(2, radius // 3)
     d.rectangle((inset, inset, w - inset, h - inset), fill=strength)
     return base.filter(ImageFilter.GaussianBlur(radius))
-
-def pick_frame_key_for_image(img: Image.Image) -> str:
-    w, h = img.size
-    ar = w / max(h, 1)
-    if ar >= 1.15:  # fairly wide
-        return "landscape"
-    if ar <= 0.87:  # fairly tall
-        return "portrait"
-    return "square"
 
 async def read_attachment_image(att: discord.Attachment) -> Image.Image | None:
     try:
@@ -1856,92 +2077,40 @@ async def read_attachment_image(att: discord.Attachment) -> Image.Image | None:
     except Exception:
         return None
 
-def compose_framed_card(frame_key: str, user_img: Image.Image, unveiled: bool = False) -> Image.Image:
-    meta = VEIL_FRAMES[frame_key]
-    frame_path = meta["file_unveiled"] if unveiled else meta["file"]
-    frame = Image.open(frame_path).convert("RGBA")
-
-    x, y, w, h = meta["window"]
-    dx, dy = meta.get("nudge", (0, 0))
-    pan = meta.get("pan", (0, 0))
-    radius = meta.get("radius", 0)
-    fit_override = meta.get("fit", "auto")
-
-    prepared = prepare_photo_for_window(
-        user_img, w, h, radius=radius, pan=pan, **_fit_kwargs(fit_override)
-    )
-
-    out = Image.new("RGBA", frame.size, (0, 0, 0, 0))
-    out.alpha_composite(prepared, (x + dx, y + dy))
-    out.alpha_composite(frame, (0, 0))
-    return out
-
 async def send_veil_message(
     interaction,
     text,
-    channel,
+    channel,  # kept for call-site compatibility; ignored for posting
     *,
-    image_attachment: discord.Attachment | None = None,  # 👈 new (optional)
+    image_attachment: discord.Attachment | None = None,
     unveiled: bool = False,
     return_file: bool = False,
     veil_msg_id: int | None = None
 ):
     """
-    Sends either a TEXT veil (existing behavior) or an IMAGE veil.
-    For IMAGE veils we:
-      1) prepare the window-sized PNG and store it + metadata in DB
-      2) compose the posted card (prepared window behind the frame)
+    Sends either a TEXT veil or an IMAGE veil.
+
+    IMPORTANT:
+    - Posting always goes to the guild's *linked* Veil channel (from DB).
+      The `channel` parameter is ignored for posting.
+    - If `return_file=True`, we return a File and do NOT post (so no linked channel is required).
     """
 
-    # ---------- helpers (scoped here so you can paste this block as-is) ----------
-    def _prepare_window_only(frame_key: str, user_img: Image.Image) -> tuple[bytes, dict]:
-        meta = VEIL_FRAMES[frame_key]
-        x, y, w, h = meta["window"]
-        dx, dy = meta.get("nudge", (0, 0))
-        pan = meta.get("pan", (0, 0))
-        radius = meta.get("radius", 0)
-        fit_override = meta.get("fit", "auto")   # <-- add
-
-        prepared_im = prepare_photo_for_window(
-            user_img, w, h, radius=radius, pan=pan, **_fit_kwargs(fit_override)   # <-- add
+    # Resolve the linked Veil channel (only required if we will actually post)
+    linked_id = get_veil_channel(interaction.guild.id)
+    channel_obj = interaction.guild.get_channel(linked_id) if linked_id else None
+    if not channel_obj and not return_file:
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title=str(client.app_emojis["veilcaution"]) + " Channel Not Linked",
+                description="This server hasn’t linked a Veil channel yet.\nUse **/configure** to set one.",
+                color=0x992d22
+            ),
+            ephemeral=True
         )
-        buf = io.BytesIO()
-        prepared_im.save(buf, format="PNG")
-        prepared_png = buf.getvalue()
+        return
 
-        meta_fields = {
-            "frame_key": frame_key,
-            "pan_x": pan[0],
-            "pan_y": pan[1],
-            "nudge_x": dx,
-            "nudge_y": dy,
-        }
-        return prepared_png, meta_fields
-
-    def _compose_from_prepared(prepared_png: bytes, frame_key: str, *, unveiled: bool) -> Image.Image:
-        meta = VEIL_FRAMES[frame_key]
-        frame_path = meta["file_unveiled"] if unveiled else meta["file"]
-        frame = Image.open(frame_path).convert("RGBA")
-
-        x, y, w, h = meta["window"]
-        dx, dy = meta.get("nudge", (0, 0))
-
-        prepared = Image.open(io.BytesIO(prepared_png)).convert("RGBA")
-        # safety: ensure prepared matches the window size
-        if prepared.size != (w, h):
-            prepared = prepared.resize((w, h), Image.LANCZOS)
-
-        out = Image.new("RGBA", frame.size, (0, 0, 0, 0))
-        out.alpha_composite(prepared, (x + dx, y + dy))   # photo behind
-        out.alpha_composite(frame, (0, 0))                # frame on top
-        return out
-    # ---------------------------------------------------------------------------
-
-    # Use the configured channel for live bot (as in your original)
-    channel_id = get_veil_channel(interaction.guild.id)
-    channel = interaction.guild.get_channel(channel_id)
-
-    # ========= IMAGE MODE =========
+    # ========= IMAGE MODE (9-slice) =========
     if image_attachment is not None:
         # Validate
         if not (image_attachment.content_type and image_attachment.content_type.startswith("image/")):
@@ -1953,26 +2122,31 @@ async def send_veil_message(
             await interaction.followup.send("I couldn’t read that image. Try a PNG or JPEG.", ephemeral=True)
             return
 
-        # choose frame by aspect
-        frame_key = pick_frame_key_for_image(user_img)
+        # choose skin pack — default "gold"
+        pack_name = "gold"
+        packs = getattr(client, "skins", {})
+        pack = packs.get(pack_name)
+        if not pack or not getattr(pack, "veil", None):
+            await interaction.followup.send("Skins not loaded.", ephemeral=True)
+            return
+        skin = pack.veil
 
-        # 1) store the prepared window + metadata
-        prepared_png, meta_fields = _prepare_window_only(frame_key, user_img)
+        # compose final card with the nine-slice frame
+        veiled_img = compose_around_photo(user_img, skin)
+        buf = io.BytesIO(); veiled_img.save(buf, format="PNG"); img_bytes = buf.getvalue()
 
-        # 2) compose the actual posted card (veiled)
-        veiled_img = _compose_from_prepared(prepared_png, frame_key, unveiled=False)
-        buf = io.BytesIO()
-        veiled_img.save(buf, format="PNG")
-        img_bytes = buf.getvalue()
+        # also keep the ORIGINAL user image bytes so we can re-frame on unveil
+        raw_buf = io.BytesIO(); user_img.save(raw_buf, format="PNG"); image_raw = raw_buf.getvalue()
 
+        # If we're only returning a file (preview/export), stop here.
         if return_file:
             return discord.File(io.BytesIO(img_bytes), filename="veil.png")
 
         # remove "New Veil" button on previous latest
-        prev_msg_id = get_latest_message_id(channel.id)
+        prev_msg_id = get_latest_message_id(channel_obj.id)
         if prev_msg_id:
             try:
-                old_msg = await channel.fetch_message(prev_msg_id)
+                old_msg = await channel_obj.fetch_message(prev_msg_id)
                 old_view = build_frozen_view(prev_msg_id, interaction.guild)
                 if old_view:
                     for child in list(old_view.children):
@@ -1985,20 +2159,20 @@ async def send_veil_message(
                 print(f"⚠️ Failed to edit old veil: {e}")
 
         # send the new veil
-        veil_no = claim_next_veil_number(channel.id)
+        veil_no = claim_next_veil_number(channel_obj.id)
         view = VeilView(veil_number=veil_no)
         file_main = discord.File(io.BytesIO(img_bytes), filename="veil.png")
-        msg = await channel.send(file=file_main, view=view)
+        msg = await channel_obj.send(file=file_main, view=view)
 
-        # DB insert (image path)
+        # DB insert — reuse prepared_png to store ORIGINAL image (back-compat)
         try:
             if conn:
                 with get_safe_cursor() as cur:
                     cur.execute(
                         """
                         INSERT INTO veil_messages
-                          (message_id, channel_id, author_id, content, veil_number, guess_count, is_unveiled,
-                           is_image, frame_key, pan_x, pan_y, nudge_x, nudge_y, prepared_png, image_mime)
+                        (message_id, channel_id, author_id, content, veil_number, guess_count, is_unveiled,
+                         is_image, frame_key, pan_x, pan_y, nudge_x, nudge_y, prepared_png, image_mime)
                         VALUES (%s,%s,%s,%s,%s,0,FALSE,
                                 TRUE,%s,%s,%s,%s,%s,%s,%s)
                         ON CONFLICT (message_id) DO NOTHING
@@ -2009,12 +2183,9 @@ async def send_veil_message(
                             interaction.user.id,
                             "[image]",
                             veil_no,
-                            meta_fields["frame_key"],
-                            meta_fields["pan_x"],
-                            meta_fields["pan_y"],
-                            meta_fields["nudge_x"],
-                            meta_fields["nudge_y"],
-                            psycopg2.Binary(prepared_png),
+                            pack_name,          # store pack name here (e.g., "gold")
+                            0, 0, 0, 0,         # pan/nudge unused in 9-slice flow
+                            psycopg2.Binary(image_raw),   # ORIGINAL image bytes
                             image_attachment.content_type or "image/png",
                         )
                     )
@@ -2024,13 +2195,13 @@ async def send_veil_message(
                         VALUES (%s, %s)
                         ON CONFLICT (channel_id) DO UPDATE SET message_id = EXCLUDED.message_id
                         """,
-                        (channel.id, msg.id)
+                        (channel_obj.id, msg.id)
                     )
                     conn.commit()
         except Exception as e:
             print(f"❌ DB insert failed (image veil): {e}")
 
-        # elite admin copy (same as your existing block)
+        # elite admin copy (unchanged)
         try:
             with get_safe_cursor() as cur:
                 cur.execute("SELECT tier FROM veil_subscriptions WHERE guild_id = %s", (interaction.guild.id,))
@@ -2053,7 +2224,7 @@ async def send_veil_message(
                         admin_view = discord.ui.View(timeout=None)
                         submitted_btn = discord.ui.Button(
                             label=f"Submitted by {display_name}",
-                            style=discord.ButtonStyle.grey,
+                            style=discord.ButtonStyle.secondary,
                             custom_id="submitted_by_admin",
                             disabled=True
                         )
@@ -2066,7 +2237,7 @@ async def send_veil_message(
 
         return msg
 
-    # ========= TEXT MODE (your existing flow) =========
+    # ========= TEXT MODE =========
     base_img = "unveilfinal_black2.png" if unveiled else "veilfinal_gold2.png"
     color = "#e5a41a" if unveiled else "#a65e00"
 
@@ -2179,14 +2350,15 @@ async def send_veil_message(
     image.save(buffer, format="PNG")
     img_bytes = buffer.getvalue()
 
+    # If we're only returning a file (preview/export), stop here.
     if return_file:
         return discord.File(io.BytesIO(img_bytes), filename="veil.png")
 
     # 1️⃣ Remove "New Veil" from previous latest message
-    prev_msg_id = get_latest_message_id(channel.id)
+    prev_msg_id = get_latest_message_id(channel_obj.id)
     if prev_msg_id:
         try:
-            old_msg = await channel.fetch_message(prev_msg_id)
+            old_msg = await channel_obj.fetch_message(prev_msg_id)
             old_view = build_frozen_view(prev_msg_id, interaction.guild)
             if old_view:
                 for child in list(old_view.children):
@@ -2199,10 +2371,10 @@ async def send_veil_message(
             print(f"⚠️ Failed to edit old veil: {e}")
 
     # 2️⃣ Send the new Veil message
-    veil_no = claim_next_veil_number(channel.id)
+    veil_no = claim_next_veil_number(channel_obj.id)
     view = VeilView(veil_number=veil_no)
     file_main = discord.File(io.BytesIO(img_bytes), filename="veil.png")
-    msg = await channel.send(file=file_main, view=view)
+    msg = await channel_obj.send(file=file_main, view=view)
 
     # 3️⃣ Insert into DB & update latest veil (text path)
     try:
@@ -2221,7 +2393,7 @@ async def send_veil_message(
                     INSERT INTO latest_veil_messages (channel_id, message_id)
                     VALUES (%s, %s)
                     ON CONFLICT (channel_id) DO UPDATE SET message_id = EXCLUDED.message_id
-                """, (channel.id, msg.id))
+                """, (channel_obj.id, msg.id))
                 conn.commit()
     except Exception as e:
         print(f"❌ DB insert failed (text veil): {e}")
@@ -2248,7 +2420,7 @@ async def send_veil_message(
                 admin_view = discord.ui.View(timeout=None)
                 submitted_btn = discord.ui.Button(
                     label=f"Submitted by {display_name}",
-                    style=discord.ButtonStyle.grey,
+                    style=discord.ButtonStyle.secondary,
                     custom_id="submitted_by_admin",
                     disabled=True
                 )
@@ -2259,7 +2431,6 @@ async def send_veil_message(
     # ─────────────────────────────────────────────────────────────────────────
 
     return msg
-
 
 # 🔶 MODAL
 class VeilModal(Modal, title="New Veil"):
@@ -2340,7 +2511,7 @@ class VeilModal(Modal, title="New Veil"):
 class NewVeilButton(Button):
     def __init__(self):
         newveilemoji = client.app_emojis['veiladd']
-        super().__init__(label="New Veil", style=discord.ButtonStyle.grey, custom_id="new_btn", emoji=newveilemoji)
+        super().__init__(label="New Veil", style=discord.ButtonStyle.secondary, custom_id="new_btn", emoji=newveilemoji)
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(VeilModal())
@@ -2351,14 +2522,14 @@ class VeilView(discord.ui.View):
         super().__init__(timeout=None)
         unveil = client.app_emojis['unveilemoji']
 
-        self.add_item(discord.ui.Button(style=discord.ButtonStyle.gray, label="Unveil", custom_id="guess_btn", emoji=unveil))
+        self.add_item(discord.ui.Button(style=discord.ButtonStyle.secondary, label="Unveil", custom_id="guess_btn", emoji=unveil))
         self.add_item(NewVeilButton())
-        self.add_item(discord.ui.Button(label="Guesses 0/3", style=discord.ButtonStyle.gray, disabled=True, custom_id="guess_count"))
-        self.add_item(discord.ui.Button(label="Submitted by █████", style=discord.ButtonStyle.gray, disabled=True, custom_id="submitted_by"))
+        self.add_item(discord.ui.Button(label="Guesses 0/3", style=discord.ButtonStyle.secondary, disabled=True, custom_id="guess_count"))
+        self.add_item(discord.ui.Button(label="Submitted by █████", style=discord.ButtonStyle.secondary, disabled=True, custom_id="submitted_by"))
 
         # New: “Veil #N” badge
         num_label = f"Veil #{veil_number}" if veil_number else "Veil #–"
-        self.add_item(discord.ui.Button(label=num_label, style=discord.ButtonStyle.gray, disabled=True, custom_id="veil_number"))
+        self.add_item(discord.ui.Button(label=num_label, style=discord.ButtonStyle.secondary, disabled=True, custom_id="veil_number"))
 
 # Compose a final card using a precomputed window PNG + a frame.
 def compose_from_prepared(prepared_png: bytes, frame_key: str, *, unveiled: bool) -> Image.Image:
@@ -2377,7 +2548,6 @@ def compose_from_prepared(prepared_png: bytes, frame_key: str, *, unveiled: bool
     out.alpha_composite(prepared, (x + dx, y + dy))  # photo behind
     out.alpha_composite(frame, (0, 0))               # frame on top
     return out
-
 
 # ===================== UNVEIL DROPDOWN =====================
 class UnveilDropdown(discord.ui.Select):
@@ -2561,36 +2731,60 @@ class UnveilDropdown(discord.ui.Select):
                 row = cur.fetchone()
 
             is_image = bool(row[0]) if row else False
+            content  = row[1] if row else ""
+            file = None  # ensure defined for both branches
 
             if is_image:
-                prepared_png = bytes(row[2]) if row and row[2] is not None else None
-                frame_key    = row[3] if row else None
+                # row: (is_image, content, prepared_png, frame_key, author_id)
+                blob = bytes(row[2]) if row and row[2] is not None else None
+                key  = row[3] if row else None
 
-                if not prepared_png or not frame_key:
+                if not blob:
                     await interaction.edit_original_response(
-                        embed=discord.Embed(
-                            title="Uh-oh",
-                            description="Missing stored image data for this veil.",
-                            color=0x992d22
-                        ),
+                        embed=discord.Embed(title="Uh-oh", description="Missing stored image data.", color=0x992d22),
                         view=None
                     )
                     return
 
-                unveiled_img = compose_from_prepared(prepared_png, frame_key, unveiled=True)
-                buf = io.BytesIO()
-                unveiled_img.save(buf, format="PNG")
-                buf.seek(0)
-                file = discord.File(buf, filename="veil.png")
+                # NEW MODE (9-slice): frame_key is a pack name like "gold" and blob is ORIGINAL image
+                if key and key not in ("landscape", "portrait", "square"):
+                    packs = getattr(client, "skins", {})
+                    pack = packs.get(key) or packs.get("gold")
+                    skin = (pack.unveil if pack and pack.unveil else pack.veil) if pack else None
+                    if not skin:
+                        await interaction.edit_original_response(
+                            embed=discord.Embed(title="Uh-oh", description="Unveil skin not available.", color=0x992d22),
+                            view=None
+                        )
+                        return
+                    try:
+                        user_img = Image.open(io.BytesIO(blob)).convert("RGBA")
+                    except Exception:
+                        await interaction.edit_original_response(
+                            embed=discord.Embed(title="Uh-oh", description="Couldn’t decode stored image.", color=0x992d22),
+                            view=None
+                        )
+                        return
+
+                    unveiled_img = compose_around_photo(user_img, skin)
+                    buf = io.BytesIO(); unveiled_img.save(buf, format="PNG"); buf.seek(0)
+                    file = discord.File(buf, filename="veil.png")
+
+                else:
+                    # OLD MODE (fixed PNG frames): frame_key is landscape/portrait/square and blob is prepared window
+                    unveiled_img = compose_from_prepared(blob, key or "square", unveiled=True)
+                    buf = io.BytesIO(); unveiled_img.save(buf, format="PNG"); buf.seek(0)
+                    file = discord.File(buf, filename="veil.png")
+
             else:
-                original_text = row[1] if row else "(missing)"
+                # 🔧 TEXT VEIL: render the unveiled TEXT card without posting (export/preview path)
                 file = await send_veil_message(
                     interaction,
-                    original_text,
-                    interaction.channel,
+                    content,
+                    interaction.channel,   # ignored because return_file=True
                     unveiled=True,
                     return_file=True,
-                    veil_msg_id=self.message_id
+                    veil_msg_id=self.message_id,
                 )
 
             # Set "Submitted by …"
@@ -2609,6 +2803,7 @@ class UnveilDropdown(discord.ui.Select):
                     child.label = f"Guesses {guess_count}/3"
                     child.disabled = True
 
+            # apply the unveiled art
             await msg.edit(attachments=[file], view=view, embed=None)
 
             # Optional rewards
@@ -2661,7 +2856,7 @@ class UnveilDropdown(discord.ui.Select):
             ),
             view=None
         )
-    
+
 class UnveilView(discord.ui.View):
     def __init__(self, message_id: int, author_id: int, interaction: discord.Interaction):
         super().__init__(timeout=None)
@@ -2870,7 +3065,8 @@ class CreateChannelButton(Button):
 
 class WelcomeView(View):
     def __init__(self):
-        super().__init__(timeout=None)  # Persistent view
+        super().__init__(timeout=None)
+        self.add_item(NewVeilButton())
 
 class AdminLog(View):
     def __init__(self):
@@ -2882,7 +3078,7 @@ class AdminLog(View):
 
 class ConfigureButton(Button):
     def __init__(self):
-        super().__init__(label="Configure", style=discord.ButtonStyle.grey, custom_id="configure", emoji="🛠️")
+        super().__init__(label="Configure", style=discord.ButtonStyle.secondary, custom_id="configure", emoji="🛠️")
 
     async def callback(self, interaction: discord.Interaction):
         incorrectmoji = str(client.app_emojis["veilincorrect"]) 
@@ -2909,7 +3105,7 @@ class ConfigureAdminLogsButton(Button):
     def __init__(self):
         super().__init__(
             label="Configure Admin Logs",
-            style=discord.ButtonStyle.grey,
+            style=discord.ButtonStyle.secondary,
             custom_id="configureadminlogs",
             emoji="🧾"
         )
@@ -3050,7 +3246,7 @@ class ConfigureVeilButton(Button):
     def __init__(self, guild_channels: list[discord.TextChannel]):
         super().__init__(
             label="Configure Veil",
-            style=discord.ButtonStyle.grey,
+            style=discord.ButtonStyle.secondary,
             custom_id="configure_veil",
             emoji="🛠️"
         )
@@ -3313,7 +3509,7 @@ class BuyCoinsButton(discord.ui.Button):
     def __init__(self, coins: int, price_cents: int):
         super().__init__(
             label=f"{_format_coins(coins)} Coins",
-            style=discord.ButtonStyle.gray,
+            style=discord.ButtonStyle.secondary,
             custom_id=f"buy_coins_{coins}",
             emoji=client.app_emojis.get("veilcoin")  # safer: won't KeyError
         )
@@ -3390,7 +3586,7 @@ class StoreView(discord.ui.View):
 
             btn.label = label
             # Use a subtle highlight for the best pack
-            btn.style = discord.ButtonStyle.blurple if i == best_idx else discord.ButtonStyle.secondary
+            btn.style = discord.ButtonStyle.primary if i == best_idx else discord.ButtonStyle.secondary
             # Force a 2-column layout on mobile: rows 0,1,2…
             btn.row = i // 2
 
@@ -3406,7 +3602,7 @@ class MyStatsButton(Button):
 
 class HelpUpgradeButton(Button):
     def __init__(self):
-        super().__init__(label="Upgrade Tier", style=discord.ButtonStyle.grey, emoji="🚀")
+        super().__init__(label="Upgrade Tier", style=discord.ButtonStyle.secondary, emoji="🚀")
 
     async def callback(self, interaction: discord.Interaction):
         # build the embed/view (your helper or inline logic)
@@ -3433,7 +3629,7 @@ class HelpView(View):
 
 class StoreButton(Button):
     def __init__(self):
-        super().__init__(label="Open Store", style=discord.ButtonStyle.grey, emoji="🏪")
+        super().__init__(label="Open Store", style=discord.ButtonStyle.secondary, emoji="🏪")
 
     async def callback(self, interaction: discord.Interaction):
         embed = build_store_embed()
@@ -4376,8 +4572,7 @@ async def guilds_cmd(inter: discord.Interaction):
             ephemeral=True
         )
 
-
-# ---- admin-only shards command ----
+# ---- owner-only shards command with total members ----
 @tree.command(name="shards", description="Show shard status")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)  # hides from non-admins in the picker
@@ -4394,30 +4589,41 @@ async def shards_cmd(inter: discord.Interaction):
             ephemeral=True
         )
 
-    # Shard latencies
+    # Shard latencies and counts
     rows = []
     shard_info = getattr(client, "shards", {}) or {}
+
     # Guilds per shard
-    per_shard_counts = Counter(g.shard_id for g in client.guilds)
+    per_shard_guilds = Counter(g.shard_id for g in client.guilds)
+
+    # Members per shard (sums member_count across guilds on that shard)
+    per_shard_members = Counter()
+    for g in client.guilds:
+        sid = g.shard_id if g.shard_id is not None else 0
+        per_shard_members[sid] += (getattr(g, "member_count", 0) or 0)
+
     total_guilds = len(client.guilds)
+    total_members = sum(per_shard_members.values())
 
     if shard_info:
         for sid, info in sorted(shard_info.items()):
             ms = int((getattr(info, "latency", client.latency) or 0) * 1000)
             dot = "🟢" if ms < 250 else ("🟡" if ms < 600 else "🔴")
-            gcount = per_shard_counts.get(sid, 0)
-            rows.append(f"{sid:>2}: {dot} {ms} ms • {gcount} guilds")
+            gcount = per_shard_guilds.get(sid, 0)
+            mcount = per_shard_members.get(sid, 0)
+            rows.append(f"{sid:>2}: {dot} {ms} ms • {gcount} guilds • {fmt(mcount)} members")
         shard_count = client.shard_count or len(shard_info)
     else:
         # Unsharded fallback
         ms = int(client.latency * 1000)
         dot = "🟢" if ms < 250 else ("🟡" if ms < 600 else "🔴")
-        rows.append(f" 0: {dot} {ms} ms • {total_guilds} guilds")
+        rows.append(f" 0: {dot} {ms} ms • {total_guilds} guilds • {fmt(total_members)} members")
         shard_count = 1
 
     header = (
         f"**Shards:** {shard_count}\n"
-        f"**Total Guilds:** {total_guilds:,}\n"
+        f"**Total Guilds:** {fmt(total_guilds)}\n"
+        f"**Total Members:** {fmt(total_members)}\n"
         "```"
         + ("\n".join(rows) if rows else "no shard data")
         + "```"
