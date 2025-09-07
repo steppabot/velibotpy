@@ -2021,8 +2021,9 @@ def compose_around_photo(user_img: Image.Image, skin: NineSliceSkin) -> Image.Im
     # 4) make the window content (photo centered on a blurred/darkened cover if padded)
     b = INNER_BLEED_PX
     if (target_w, target_h) == (win_w, win_h):
-        # no pad: just add bleed
-        photo_plane = user_img.resize((win_w + 2*b, win_h + 2*b), Image.LANCZOS)
+        # ✅ no pad: keep pixels, just add a transparent margin and paste
+        photo_plane = Image.new("RGBA", (win_w + 2*b, win_h + 2*b), (0, 0, 0, 0))
+        photo_plane.alpha_composite(user_img, (b, b))
     else:
         # padded: make blurred/darkened cover
         sw, sh = user_img.size
@@ -2101,7 +2102,11 @@ async def read_attachment_image(att: discord.Attachment) -> Image.Image | None:
         data = await att.read()
         im = Image.open(io.BytesIO(data))
         im.load()
-        return _exif(im).convert("RGB")
+        im = _exif(im)
+        # ✅ preserve transparency
+        if im.mode != "RGBA":
+            im = im.convert("RGBA")
+        return im
     except Exception:
         return None
 
