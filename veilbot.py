@@ -1824,18 +1824,40 @@ class NineSliceSkin:
 
     def required_window_min(self) -> tuple[int, int]:
         """
-        Conservative lower bounds for the inner window so top/bottom center spans don't go negative
-        and left/right edges have room between the opaque tails.
+        Minimum inner window (w, h) so the corners never collide.
+        Uses opaque spans + edge thickness + per-corner offsets.
         """
-        # horizontal: leave at least 8px between TL's last opaque col and TR's first opaque col
         gap_x = 8
-        min_w = (self.corner_tl.width - self._tl_top_last - 1) + (self.corner_tr.width - self._tr_top_first) + gap_x
-        # vertical: same idea for left/right
         gap_y = 8
-        min_h = (self.corner_tl.height - self._tl_left_last - 1) + (self.corner_bl.height - self._bl_left_first) + gap_y
-        # never smaller than the straight edge thicknesses
-        min_w = max(min_w, self.th_left + self.th_right + 16)
-        min_h = max(min_h, self.th_top  + self.th_bottom + 16)
+
+        tl_ox, tl_oy = CORNER_OFFSETS.get("tl", (0, 0))
+        tr_ox, tr_oy = CORNER_OFFSETS.get("tr", (0, 0))
+        bl_ox, bl_oy = CORNER_OFFSETS.get("bl", (0, 0))
+        br_ox, br_oy = CORNER_OFFSETS.get("br", (0, 0))
+
+        # --- Horizontal (top row & bottom row) ---
+        # how much each corner intrudes into the window from its side
+        L_tail_top = max(0, (self._tl_top_last + 1 + tl_ox) - self.th_left)
+        R_tail_top = max(0, (self.corner_tr.width - self.th_right - tr_ox - self._tr_top_first))
+
+        L_tail_bot = max(0, (self._bl_bot_last + 1 + bl_ox) - self.th_left)
+        R_tail_bot = max(0, (self.corner_br.width - self.th_right - br_ox - self._br_bot_first))
+
+        min_w_top = L_tail_top + R_tail_top + gap_x
+        min_w_bot = L_tail_bot + R_tail_bot + gap_x
+        min_w = max(min_w_top, min_w_bot, self.th_left + self.th_right + 16)
+
+        # --- Vertical (left column & right column) ---
+        T_tail_left  = max(0, (self._tl_left_last + 1 + tl_oy) - self.th_top)
+        B_tail_left  = max(0, (self.corner_bl.height - self.th_bottom - bl_oy - self._bl_left_first))
+
+        T_tail_right = max(0, (self._tr_right_last + 1 + tr_oy) - self.th_top)
+        B_tail_right = max(0, (self.corner_br.height - self.th_bottom - br_oy - self._br_right_first))
+
+        min_h_left  = T_tail_left  + B_tail_left  + gap_y
+        min_h_right = T_tail_right + B_tail_right + gap_y
+        min_h = max(min_h_left, min_h_right, self.th_top + self.th_bottom + 16)
+
         return (min_w, min_h)
 
     def build_overlay(self, window_w: int, window_h: int) -> tuple[Image.Image, tuple[int,int,int,int]]:
