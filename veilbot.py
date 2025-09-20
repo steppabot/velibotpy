@@ -175,11 +175,11 @@ def init_db():
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS vote_events (
                 id        BIGSERIAL PRIMARY KEY,
-                provider  TEXT NOT NULL,     -- 'topgg', 'dbl', etc.
+                provider  TEXT NOT NULL, 
                 user_id   BIGINT NOT NULL,
                 guild_id  BIGINT NOT NULL,
                 voted_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-                nonce     TEXT UNIQUE        -- idempotency key (e.g., session_id)
+                nonce     TEXT UNIQUE
             )
         ''')
 
@@ -193,18 +193,9 @@ def init_db():
             ON vote_events (user_id)
         ''')
         cursor.execute('''
-            CREATE INDEX IF NOT EXISTS vote_events_month_idx
-            ON vote_events (date_trunc('month', voted_at))
-        ''')
-        cursor.execute('''
             CREATE INDEX IF NOT EXISTS vote_events_user_month_idx
             ON vote_events (user_id, voted_at)
         ''')
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS vote_events_ct_day_idx
-            ON vote_events ( ((voted_at AT TIME ZONE 'America/Chicago')::date) )
-        ''')
-
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS veil_channels (
                 guild_id BIGINT PRIMARY KEY,
