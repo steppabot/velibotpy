@@ -10,6 +10,7 @@ from psycopg2 import sql
 from copy import deepcopy
 from discord import PartialEmoji
 from typing import Optional
+from discord.errors import HTTPException
 from bidi.algorithm import get_display
 from io import BytesIO
 import io
@@ -115,6 +116,16 @@ def init_db():
                 current_number INTEGER NOT NULL DEFAULT 0
             )
         """)
+
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS veil_settings (
+                guild_id    BIGINT PRIMARY KEY,
+                max_guesses SMALLINT NOT NULL DEFAULT 3
+                    CHECK (max_guesses BETWEEN 1 AND 3)
+            )
+        """)
+
 
         
         # ─── veil_guesses ──────────────────────────────────────────────────────
@@ -477,6 +488,41 @@ FONT_MAP = {
 
 MAX_SRC_LONG = 1600  # pick your comfort number
 
+def get_max_guesses(guild_id: int) -> int:
+    try:
+        with get_safe_cursor() as cur:
+            cur.execute("SELECT max_guesses FROM veil_settings WHERE guild_id=%s", (guild_id,))
+            row = cur.fetchone()
+            if not row:
+                # ensure a default row exists; future reads hit the table
+                cur.execute("""
+                    INSERT INTO veil_settings (guild_id, max_guesses)
+                    VALUES (%s, 3)
+                    ON CONFLICT (guild_id) DO NOTHING
+                """, (guild_id,))
+                return 3
+            val = int(row[0])
+            return 3 if val < 1 or val > 3 else val
+    except Exception:
+        return 3
+
+def set_max_guesses(guild_id: int, value: int) -> int:
+    value = max(1, min(3, int(value)))
+    with get_safe_cursor() as cur:
+        cur.execute("""
+            INSERT INTO veil_settings (guild_id, max_guesses)
+            VALUES (%s, %s)
+            ON CONFLICT (guild_id) DO UPDATE SET max_guesses = EXCLUDED.max_guesses
+        """, (guild_id, value))
+    return value
+
+def ensure_settings_row(guild_id: int):
+    with get_safe_cursor() as cur:
+        cur.execute("""
+            INSERT INTO veil_settings (guild_id, max_guesses)
+            VALUES (%s, 3)
+            ON CONFLICT (guild_id) DO NOTHING
+        """, (guild_id,))
 
 def _safe_display_name(member):
     return member.display_name if member else None
@@ -1013,23 +1059,24 @@ def build_frozen_view(msg_id: int, guild: discord.Guild):
 
         channel_id, guess_count, is_unveiled, author_id, veil_number = row
         author_member = guild.get_member(author_id)
+        # NEW: read cap per guild
+        cap = get_max_guesses(guild.id)
 
         # Build the base view with the correct per-channel number
-        view = VeilView(veil_number=veil_number)
 
-        # Update labels / disablements
+        view = VeilView(veil_number=veil_number, max_guesses=cap, guess_count=guess_count)
+
         for child in list(view.children):
             if isinstance(child, discord.ui.Button):
                 if child.custom_id == "guess_count":
-                    child.label = f"Guesses {guess_count}/3"
+                    child.label = f"Guesses {guess_count}/{cap}"
                 elif child.custom_id == "submitted_by":
                     if is_unveiled and author_member:
                         display_name = get_display_name_safe(author_member)
                         child.label = f"Submitted by {display_name.capitalize()}"
                 elif child.custom_id == "guess_btn":
-                    child.disabled = is_unveiled or guess_count >= 3
+                    child.disabled = is_unveiled or (guess_count >= cap)
                 elif child.custom_id == "new_btn":
-                    # ✅ Use the *channel* to check latest
                     if not is_latest_veil(channel_id, msg_id):
                         view.remove_item(child)
 
@@ -2218,7 +2265,8 @@ async def send_veil_message(
 
         # send the new veil
         veil_no = claim_next_veil_number(channel_obj.id)
-        view = VeilView(veil_number=veil_no)
+        cap = get_max_guesses(interaction.guild.id)        # ← NEW
+        view = VeilView(veil_number=veil_no, max_guesses=cap, guess_count=0)
         file_main = discord.File(io.BytesIO(img_bytes), filename="veil.png")
         msg = await channel_obj.send(file=file_main, view=view)
 
@@ -2430,7 +2478,8 @@ async def send_veil_message(
 
     # 2️⃣ Send the new Veil message
     veil_no = claim_next_veil_number(channel_obj.id)
-    view = VeilView(veil_number=veil_no)
+    cap = get_max_guesses(interaction.guild.id)          # NEW
+    view = VeilView(veil_number=veil_no, max_guesses=cap, guess_count=0)  # NEW
     file_main = discord.File(io.BytesIO(img_bytes), filename="veil.png")
     msg = await channel_obj.send(file=file_main, view=view)
 
@@ -2576,16 +2625,15 @@ class NewVeilButton(Button):
 
 # 🎨 COMBINED VIEW FOR VEIL MESSAGE
 class VeilView(discord.ui.View):
-    def __init__(self, veil_number: int | None = None):
+    def __init__(self, veil_number: int | None = None, *, max_guesses: int = 3, guess_count: int = 0):
         super().__init__(timeout=None)
         unveil = client.app_emojis['unveilemoji']
 
         self.add_item(discord.ui.Button(style=discord.ButtonStyle.secondary, label="Unveil", custom_id="guess_btn", emoji=unveil))
         self.add_item(NewVeilButton())
-        self.add_item(discord.ui.Button(label="Guesses 0/3", style=discord.ButtonStyle.secondary, disabled=True, custom_id="guess_count"))
+        self.add_item(discord.ui.Button(label=f"Guesses {guess_count}/{max_guesses}", style=discord.ButtonStyle.secondary, disabled=True, custom_id="guess_count"))
         self.add_item(discord.ui.Button(label="Submitted by █████", style=discord.ButtonStyle.secondary, disabled=True, custom_id="submitted_by"))
 
-        # New: “Veil #N” badge
         num_label = f"Veil #{veil_number}" if veil_number else "Veil #–"
         self.add_item(discord.ui.Button(label=num_label, style=discord.ButtonStyle.secondary, disabled=True, custom_id="veil_number"))
 
@@ -2630,6 +2678,7 @@ class UnveilDropdown(discord.ui.Select):
         tier = get_subscription_tier(guild_id)
         is_elite = (tier == "elite")
 
+        cap = get_max_guesses(guild_id)
         # 1) Quick ACK
         try:
             await interaction.response.edit_message(
@@ -2687,11 +2736,11 @@ class UnveilDropdown(discord.ui.Select):
                 )
 
             guess_count, real_author_id, is_unveiled = row
-            if is_unveiled or guess_count >= 3:
+            if is_unveiled or guess_count >= cap:
                 return await interaction.edit_original_response(
                     embed=discord.Embed(
                         title=f"{incorrectmoji} No More Guesses",
-                        description="This veil is already unveiled or has 3 guesses.",
+                        description=f"This veil is already unveiled or has {cap} guesses.",
                         color=0x992d22
                     ),
                     view=None
@@ -2772,9 +2821,9 @@ class UnveilDropdown(discord.ui.Select):
         for child in view.children:
             if isinstance(child, discord.ui.Button):
                 if child.custom_id == "guess_count":
-                    child.label = f"Guesses {guess_count}/3"
-                    child.disabled = True if (is_correct and won) or guess_count >= 3 else child.disabled
-                elif child.custom_id == "guess_btn" and ((is_correct and won) or guess_count >= 3):
+                    child.label = f"Guesses {guess_count}/{cap}"
+                    child.disabled = True if (is_correct and won) or guess_count >= cap else child.disabled
+                elif child.custom_id == "guess_btn" and ((is_correct and won) or guess_count >= cap):
                     child.disabled = True
 
         # 5) Outcomes
@@ -2893,11 +2942,11 @@ class UnveilDropdown(discord.ui.Select):
                 view=None
             )
 
-        if guess_count >= 3:
+        if guess_count >= cap:
             await msg.edit(view=view)
             return await interaction.edit_original_response(
                 embed=discord.Embed(
-                    title=f"{incorrectmoji} 3 Guesses Used",
+                    title=f"{incorrectmoji} {cap} Guesses Used",
                     description="The veil remains on this message.",
                     color=0x992d22
                 ),
@@ -4746,6 +4795,46 @@ async def vote_cmd(interaction: discord.Interaction):
         color=0xeeac00
     )
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+@tree.command(name="maxguess", description="(Admin) Set the max guesses per veil (1–3)")
+@app_commands.describe(guesses="Number of guesses allowed (1–3)")
+@app_commands.checks.has_permissions(administrator=True)
+async def maxguess_cmd(interaction: discord.Interaction, guesses: app_commands.Range[int, 1, 3]):
+    val = set_max_guesses(interaction.guild.id, guesses)
+    await interaction.response.send_message(
+        embed=discord.Embed(
+            title="🛠️ Max Guesses Updated",
+            description=f"Users now have **{val}** guess{'es' if val>1 else ''} per veil.",
+            color=0xeeac00
+        ),
+        ephemeral=True
+    )
+
+@maxguess_cmd.error
+async def maxguess_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.errors.MissingPermissions):
+        incorrectmoji = str(client.app_emojis.get("veilincorrect", "❌"))
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title=f"{incorrectmoji} Admin Only",
+                description="You must be an **administrator** to run this command.",
+                color=0x992d22
+            ),
+            ephemeral=True
+        )
+
+@tree.command(name="globalonly", description="Owner-Only: Sync Global Commands")
+async def fixdupes_globalonly(inter):
+    if inter.user.id not in OWNER_IDS:  # your owner gate
+        return await inter.response.send_message("Owner only.", ephemeral=True)
+
+    # 1) Purge per-guild commands everywhere
+    for g in client.guilds:
+        tree.clear_commands(guild=g)      # clear local cache for that guild
+        await tree.sync(guild=g)          # sync empty => deletes remote guild cmds
+
+    # 2) Ensure you only call: await tree.sync() at startup (no per-guild syncs)
+    await inter.response.send_message("Per-guild commands purged. Global-only now.", ephemeral=True)
 
 @client.event
 async def on_message(message: discord.Message):
