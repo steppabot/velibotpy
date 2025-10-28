@@ -109,14 +109,6 @@ def init_db():
             ON veil_messages(channel_id, veil_number)
         """)
 
-        # simple per-channel counter; we store the *last assigned* number
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS veil_settings (
-                guild_id    BIGINT PRIMARY KEY,
-                max_guesses SMALLINT NOT NULL DEFAULT 3 CHECK (max_guesses BETWEEN 1 AND 3)
-        """)
-
-
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS veil_channel_counters (
                 channel_id BIGINT PRIMARY KEY,
