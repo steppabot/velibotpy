@@ -4824,17 +4824,46 @@ async def maxguess_error(interaction: discord.Interaction, error):
         )
 
 @tree.command(name="globalonly", description="Owner-Only: Sync Global Commands")
-async def fixdupes_globalonly(inter):
-    if inter.user.id not in OWNER_IDS:  # your owner gate
+async def fixdupes_globalonly(inter: discord.Interaction):
+    if inter.user.id not in OWNER_IDS:
         return await inter.response.send_message("Owner only.", ephemeral=True)
 
-    # 1) Purge per-guild commands everywhere
-    for g in client.guilds:
-        tree.clear_commands(guild=g)      # clear local cache for that guild
-        await tree.sync(guild=g)          # sync empty => deletes remote guild cmds
+    # Defer immediately so we don't time out (ephemeral keeps it private)
+    try:
+        await inter.response.defer(ephemeral=True, thinking=True)
+    except Exception:
+        # If already responded somewhere else, we'll just use followups later
+        pass
 
-    # 2) Ensure you only call: await tree.sync() at startup (no per-guild syncs)
-    await inter.response.send_message("Per-guild commands purged. Global-only now.", ephemeral=True)
+    ok = 0
+    fail = 0
+    for g in list(client.guilds):
+        try:
+            # Clear local cache for that guild and push the empty set (deletes remote guild cmds)
+            tree.clear_commands(guild=g)
+            await tree.sync(guild=g)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            # Optional: log the guild + error
+            print(f"[globalonly] Failed to purge guild {g.id} ({getattr(g, 'name', '?')}): {e}")
+
+    # IMPORTANT: going forward, only call await tree.sync() globally at startup (no per-guild syncs)
+    msg = f"Per-guild commands purged in {ok} guild(s)"
+    if fail:
+        msg += f"; {fail} failed (check logs)."
+    else:
+        msg += "."
+
+    # Send the result
+    try:
+        await inter.followup.send(msg + " Global-only now. Make sure you only call `await tree.sync()` once at startup.", ephemeral=True)
+    except Exception:
+        # Fallback if followup fails for some reason
+        try:
+            await inter.response.send_message(msg, ephemeral=True)
+        except Exception:
+            pass
 
 @client.event
 async def on_message(message: discord.Message):
