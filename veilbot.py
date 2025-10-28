@@ -13,6 +13,7 @@ from typing import Optional
 from bidi.algorithm import get_display
 from io import BytesIO
 from discord.errors import HTTPException
+import psycopg2.extras
 import io
 import os
 import re
@@ -34,17 +35,242 @@ stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 # Load database URL from environment
 DATABASE_URL = os.getenv("DATABAif not inserted:SE_URL")
 
+conn = None  # single global connection
+
+def _normalize_dsn(url: str) -> str:
+    # psycopg2 supports postgres:// but normalize anyway
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    if "sslmode=" not in url:
+        url += ("&" if "?" in url else "?") + "sslmode=require"
+    return url
+
+def init_db():
+    """Initialize global DB connection and ensure schema exists. Safe to call multiple times."""
+    global conn
+    url = os.getenv("BUBU_DATABASE_URL") or os.getenv("DATABASE_URL")
+    if not url:
+        raise RuntimeError("DATABASE_URL / BUBU_DATABASE_URL not set")
+
+    dsn = _normalize_dsn(url)
+
+    # (Re)connect
+    conn = psycopg2.connect(
+        dsn,
+        connect_timeout=8,
+        keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=5,
+        cursor_factory=psycopg2.extras.DictCursor,
+    )
+    conn.autocommit = False  # we control commits
+
+    # Build/patch schema in one transaction
+    try:
+        with conn.cursor() as cursor:
+            # ─── veil_messages ───────────────────────────────────────────────
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS veil_messages (
+                    id SERIAL PRIMARY KEY,
+                    message_id BIGINT UNIQUE NOT NULL,
+                    channel_id BIGINT NOT NULL,
+                    author_id BIGINT NOT NULL,
+                    content TEXT NOT NULL,
+                    timestamp TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+
+            cursor.execute("""
+                SELECT column_name
+                  FROM information_schema.columns
+                 WHERE table_name = 'veil_messages'
+            """)
+            cols = {row[0] for row in cursor.fetchall()}
+            if 'guess_count'  not in cols: cursor.execute("ALTER TABLE veil_messages ADD COLUMN guess_count INTEGER DEFAULT 0")
+            if 'is_unveiled'  not in cols: cursor.execute("ALTER TABLE veil_messages ADD COLUMN is_unveiled BOOLEAN DEFAULT FALSE")
+            if 'veil_number'  not in cols: cursor.execute("ALTER TABLE veil_messages ADD COLUMN veil_number INTEGER")
+            if 'is_image'     not in cols: cursor.execute("ALTER TABLE veil_messages ADD COLUMN is_image BOOLEAN NOT NULL DEFAULT FALSE")
+            if 'frame_key'    not in cols: cursor.execute("ALTER TABLE veil_messages ADD COLUMN frame_key TEXT")
+            if 'pan_x'        not in cols: cursor.execute("ALTER TABLE veil_messages ADD COLUMN pan_x INTEGER")
+            if 'pan_y'        not in cols: cursor.execute("ALTER TABLE veil_messages ADD COLUMN pan_y INTEGER")
+            if 'nudge_x'      not in cols: cursor.execute("ALTER TABLE veil_messages ADD COLUMN nudge_x INTEGER")
+            if 'nudge_y'      not in cols: cursor.execute("ALTER TABLE veil_messages ADD COLUMN nudge_y INTEGER")
+            if 'prepared_png' not in cols: cursor.execute("ALTER TABLE veil_messages ADD COLUMN prepared_png BYTEA")
+            if 'image_mime'   not in cols: cursor.execute("ALTER TABLE veil_messages ADD COLUMN image_mime TEXT")
+
+            cursor.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_vm_channel_veilno
+                ON veil_messages(channel_id, veil_number)
+            """)
+
+            # ─── per-guild settings / counters ───────────────────────────────
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS veil_settings (
+                    guild_id    BIGINT PRIMARY KEY,
+                    max_guesses SMALLINT NOT NULL DEFAULT 3 CHECK (max_guesses BETWEEN 1 AND 3)
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS veil_channel_counters (
+                    channel_id BIGINT PRIMARY KEY,
+                    current_number INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+
+            # ─── veil_guesses ────────────────────────────────────────────────
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS veil_guesses (
+                    id SERIAL PRIMARY KEY,
+                    message_id BIGINT NOT NULL,
+                    guesser_id BIGINT NOT NULL,
+                    guessed_user_id BIGINT NOT NULL,
+                    timestamp TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE (message_id, guesser_id)
+                )
+            """)
+            cursor.execute("""
+                SELECT column_name
+                  FROM information_schema.columns
+                 WHERE table_name = 'veil_guesses'
+            """)
+            guess_cols = {row[0] for row in cursor.fetchall()}
+            if 'is_correct' not in guess_cols:
+                cursor.execute("ALTER TABLE veil_guesses ADD COLUMN is_correct BOOLEAN NOT NULL DEFAULT FALSE")
+
+            # ─── latest_veil_messages / users / channels / admin channels ───
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS latest_veil_messages (
+                    channel_id BIGINT PRIMARY KEY,
+                    message_id BIGINT NOT NULL
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS veil_users (
+                    user_id BIGINT NOT NULL,
+                    guild_id BIGINT NOT NULL,
+                    coins INTEGER DEFAULT 0,
+                    veils_unveiled INTEGER DEFAULT 0,
+                    last_reset TIMESTAMPTZ DEFAULT NOW(),
+                    PRIMARY KEY (user_id, guild_id)
+                )
+            """)
+            cursor.execute("""
+                SELECT column_name
+                  FROM information_schema.columns
+                 WHERE table_name = 'veil_users'
+            """)
+            user_cols = {row[0] for row in cursor.fetchall()}
+            if 'last_refill'        not in user_cols: cursor.execute("ALTER TABLE veil_users ADD COLUMN last_refill TIMESTAMPTZ")
+            if 'topgg_last_vote_at' not in user_cols: cursor.execute("ALTER TABLE veil_users ADD COLUMN topgg_last_vote_at TIMESTAMPTZ")
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS veil_channels (
+                    guild_id BIGINT PRIMARY KEY,
+                    channel_id BIGINT NOT NULL
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS veil_admin_channels (
+                    guild_id BIGINT PRIMARY KEY,
+                    channel_id BIGINT NOT NULL
+                )
+            """)
+
+            # ─── subscriptions ───────────────────────────────────────────────
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS veil_subscriptions (
+                    guild_id BIGINT PRIMARY KEY,
+                    tier TEXT NOT NULL DEFAULT 'free',
+                    subscribed_at TIMESTAMPTZ DEFAULT NOW(),
+                    renews_at TIMESTAMPTZ,
+                    payment_failed BOOLEAN DEFAULT FALSE
+                )
+            """)
+            cursor.execute("""
+                SELECT column_name
+                  FROM information_schema.columns
+                 WHERE table_name = 'veil_subscriptions'
+            """)
+            sub_cols = {row[0] for row in cursor.fetchall()}
+            if 'subscription_id' not in sub_cols:
+                cursor.execute("ALTER TABLE veil_subscriptions ADD COLUMN subscription_id TEXT")
+
+            # ─── coin checkout sessions ──────────────────────────────────────
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS coin_checkout_sessions (
+                    stripe_session_id TEXT PRIMARY KEY,
+                    interaction_token TEXT NOT NULL,
+                    application_id   BIGINT NOT NULL,
+                    user_id          BIGINT NOT NULL,
+                    guild_id         BIGINT NOT NULL,
+                    coins            INTEGER NOT NULL,
+                    created_at       TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_coin_checkout_sessions_created_at
+                ON coin_checkout_sessions (created_at)
+            """)
+
+            # ─── top.gg vote sessions + vote events ─────────────────────────
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS topgg_vote_sessions (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    guild_id BIGINT NOT NULL,
+                    interaction_token TEXT NOT NULL,
+                    application_id BIGINT NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    used BOOLEAN NOT NULL DEFAULT FALSE
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS vote_events (
+                    id        BIGSERIAL PRIMARY KEY,
+                    provider  TEXT NOT NULL,
+                    user_id   BIGINT NOT NULL,
+                    guild_id  BIGINT NOT NULL,
+                    voted_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    nonce     TEXT UNIQUE
+                )
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS vote_events_voted_at_idx ON vote_events (voted_at);
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS vote_events_user_id_idx ON vote_events (user_id);
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS vote_events_user_month_idx ON vote_events (user_id, voted_at);
+            """)
+
+        conn.commit()
+        # Optional: log where we connected
+        try:
+            params = conn.get_dsn_parameters()
+            print(f"✅ DB connected host={params.get('host')} db={params.get('dbname')} sslmode={params.get('sslmode')}")
+        except Exception:
+            pass
+
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        print(f"Database error during init: {e}")
+        raise
+
+    return conn  # no cursor return
+
 @contextlib.contextmanager
 def get_safe_cursor():
+    """Reuses the global connection, pings, reconnects if needed, and commits/rolls back."""
     global conn
-    try:
-        # ping to detect a dead connection
-        with conn.cursor() as ping:
-            ping.execute("SELECT 1")
-    except (psycopg2.InterfaceError, psycopg2.OperationalError):
-        # reconnect if needed
-        print("🔁 Reconnecting to database...")
-        conn, _ = init_db()
+    if conn is None:
+        conn = init_db()
+    else:
+        try:
+            with conn.cursor() as ping:
+                ping.execute("SELECT 1")
+        except (psycopg2.InterfaceError, psycopg2.OperationalError):
+            print("🔁 Reconnecting to database…")
+            conn = init_db()
 
     cur = conn.cursor()
     try:
@@ -55,223 +281,6 @@ def get_safe_cursor():
         raise
     finally:
         cur.close()
-
-def init_db():
-    try:
-        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
-        cursor = conn.cursor()
-
-        # ─── veil_messages ─────────────────────────────────────────────────────
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS veil_messages (
-                id SERIAL PRIMARY KEY,
-                message_id BIGINT UNIQUE NOT NULL,
-                channel_id BIGINT NOT NULL,
-                author_id BIGINT NOT NULL,
-                content TEXT NOT NULL,
-                timestamp TIMESTAMPTZ DEFAULT NOW()
-            )
-        ''')
-
-        cursor.execute("""
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name = 'veil_messages'
-        """)
-        cols = {row[0] for row in cursor.fetchall()}
-
-        if 'guess_count' not in cols:
-            cursor.execute("ALTER TABLE veil_messages ADD COLUMN guess_count INTEGER DEFAULT 0")
-        if 'is_unveiled' not in cols:
-            cursor.execute("ALTER TABLE veil_messages ADD COLUMN is_unveiled BOOLEAN DEFAULT FALSE")
-        if 'veil_number' not in cols:
-            cursor.execute("ALTER TABLE veil_messages ADD COLUMN veil_number INTEGER")
-
-        # 🔹 New image-related fields
-        if 'is_image' not in cols:
-            cursor.execute("ALTER TABLE veil_messages ADD COLUMN is_image BOOLEAN NOT NULL DEFAULT FALSE")
-        if 'frame_key' not in cols:
-            cursor.execute("ALTER TABLE veil_messages ADD COLUMN frame_key TEXT")
-        if 'pan_x' not in cols:
-            cursor.execute("ALTER TABLE veil_messages ADD COLUMN pan_x INTEGER")
-        if 'pan_y' not in cols:
-            cursor.execute("ALTER TABLE veil_messages ADD COLUMN pan_y INTEGER")
-        if 'nudge_x' not in cols:
-            cursor.execute("ALTER TABLE veil_messages ADD COLUMN nudge_x INTEGER")
-        if 'nudge_y' not in cols:
-            cursor.execute("ALTER TABLE veil_messages ADD COLUMN nudge_y INTEGER")
-        if 'prepared_png' not in cols:
-            cursor.execute("ALTER TABLE veil_messages ADD COLUMN prepared_png BYTEA")
-        if 'image_mime' not in cols:
-            cursor.execute("ALTER TABLE veil_messages ADD COLUMN image_mime TEXT")
-
-        cursor.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_vm_channel_veilno
-            ON veil_messages(channel_id, veil_number)
-        """)
-
-        # simple per-channel counter; we store the *last assigned* number
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS veil_settings (
-                guild_id    BIGINT PRIMARY KEY,
-                max_guesses SMALLINT NOT NULL DEFAULT 3
-                    CHECK (max_guesses BETWEEN 1 AND 3)
-            )
-        """)
-
-
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS veil_channel_counters (
-                channel_id BIGINT PRIMARY KEY,
-                current_number INTEGER NOT NULL DEFAULT 0
-            )
-        """)
-
-        
-        # ─── veil_guesses ──────────────────────────────────────────────────────
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS veil_guesses (
-                id SERIAL PRIMARY KEY,
-                message_id BIGINT NOT NULL,
-                guesser_id  BIGINT NOT NULL,
-                guessed_user_id BIGINT NOT NULL,
-                timestamp TIMESTAMPTZ DEFAULT NOW(),
-                UNIQUE (message_id, guesser_id)
-            )
-        ''')
-
-        # Ensure is_correct column exists
-        cursor.execute("""
-            SELECT column_name
-              FROM information_schema.columns
-             WHERE table_name = 'veil_guesses'
-        """)
-        guess_cols = {row[0] for row in cursor.fetchall()}
-        if 'is_correct' not in guess_cols:
-            cursor.execute(
-                "ALTER TABLE veil_guesses ADD COLUMN is_correct BOOLEAN NOT NULL DEFAULT FALSE"
-            )
-
-        # ─── latest_veil_messages, veil_users, veil_channels, etc. ─────────────
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS latest_veil_messages (
-                channel_id BIGINT PRIMARY KEY,
-                message_id BIGINT NOT NULL
-            )
-        ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS veil_users (
-                user_id BIGINT NOT NULL,
-                guild_id BIGINT NOT NULL,
-                coins INTEGER DEFAULT 0,
-                veils_unveiled INTEGER DEFAULT 0,
-                last_reset TIMESTAMPTZ DEFAULT NOW(),
-                PRIMARY KEY (user_id, guild_id)
-            )
-        ''')
-        cursor.execute("""
-            SELECT column_name
-              FROM information_schema.columns
-             WHERE table_name = 'veil_users'
-        """)
-        user_cols = {row[0] for row in cursor.fetchall()}
-        if 'last_refill' not in user_cols:
-            cursor.execute("ALTER TABLE veil_users ADD COLUMN last_refill TIMESTAMPTZ")
-        
-        # 🔹 NEW: track the last top.gg vote time
-        if 'topgg_last_vote_at' not in user_cols:
-            cursor.execute("ALTER TABLE veil_users ADD COLUMN topgg_last_vote_at TIMESTAMPTZ")
-
-        # ─── ROLLING VOTE LOG (for monthly leaderboards + history) ────────────
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS vote_events (
-                id        BIGSERIAL PRIMARY KEY,
-                provider  TEXT NOT NULL, 
-                user_id   BIGINT NOT NULL,
-                guild_id  BIGINT NOT NULL,
-                voted_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-                nonce     TEXT UNIQUE
-            )
-        ''')
-
-        # Helpful indexes for common queries
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS vote_events_voted_at_idx
-            ON vote_events (voted_at)
-        ''')
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS vote_events_user_id_idx
-            ON vote_events (user_id)
-        ''')
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS vote_events_user_month_idx
-            ON vote_events (user_id, voted_at)
-        ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS veil_channels (
-                guild_id BIGINT PRIMARY KEY,
-                channel_id BIGINT NOT NULL
-            )
-        ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS veil_admin_channels (
-                guild_id BIGINT PRIMARY KEY,
-                channel_id BIGINT NOT NULL
-            )
-        ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS veil_subscriptions (
-                guild_id BIGINT PRIMARY KEY,
-                tier TEXT NOT NULL DEFAULT 'free',
-                subscribed_at TIMESTAMPTZ DEFAULT NOW(),
-                renews_at TIMESTAMPTZ,
-                payment_failed BOOLEAN DEFAULT FALSE
-            )
-        ''')
-        cursor.execute("""
-            SELECT column_name
-              FROM information_schema.columns
-             WHERE table_name = 'veil_subscriptions'
-        """)
-        sub_cols = {row[0] for row in cursor.fetchall()}
-        if 'subscription_id' not in sub_cols:
-            cursor.execute("ALTER TABLE veil_subscriptions ADD COLUMN subscription_id TEXT")
-
-        # ─── coin_checkout_sessions (for editing ephemeral after purchase) ───
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS coin_checkout_sessions (
-                stripe_session_id TEXT PRIMARY KEY,
-                interaction_token TEXT NOT NULL,
-                application_id   BIGINT NOT NULL,
-                user_id          BIGINT NOT NULL,
-                guild_id         BIGINT NOT NULL,
-                coins            INTEGER NOT NULL,
-                created_at       TIMESTAMPTZ DEFAULT NOW()
-            )
-        ''')
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_coin_checkout_sessions_created_at
-            ON coin_checkout_sessions (created_at)
-        ''')
-
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS topgg_vote_sessions (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                guild_id BIGINT NOT NULL,
-                interaction_token TEXT NOT NULL,
-                application_id BIGINT NOT NULL,
-                created_at TIMESTAMPTZ DEFAULT NOW(),
-                used BOOLEAN NOT NULL DEFAULT FALSE
-            )
-        """)
-
-        conn.commit()
-        return conn, cursor
-
-    except Exception as e:
-        print(f"Database error: {e}")
-        return None, None
 
 ZWS = "\u200B"
 
