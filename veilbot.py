@@ -12,8 +12,6 @@ from discord import PartialEmoji
 from typing import Optional
 from bidi.algorithm import get_display
 from io import BytesIO
-from discord.errors import HTTPException
-import psycopg2.extras
 import io
 import os
 import re
@@ -33,244 +31,19 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 # Load database URL from environment
-DATABASE_URL = os.getenv("DATABAif not inserted:SE_URL")
-
-conn = None  # single global connection
-
-def _normalize_dsn(url: str) -> str:
-    # psycopg2 supports postgres:// but normalize anyway
-    if url.startswith("postgres://"):
-        url = "postgresql://" + url[len("postgres://"):]
-    if "sslmode=" not in url:
-        url += ("&" if "?" in url else "?") + "sslmode=require"
-    return url
-
-def init_db():
-    """Initialize global DB connection and ensure schema exists. Safe to call multiple times."""
-    global conn
-    url = os.getenv("BUBU_DATABASE_URL") or os.getenv("DATABASE_URL")
-    if not url:
-        raise RuntimeError("DATABASE_URL / BUBU_DATABASE_URL not set")
-
-    dsn = _normalize_dsn(url)
-
-    # (Re)connect
-    conn = psycopg2.connect(
-        dsn,
-        connect_timeout=8,
-        keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=5,
-        cursor_factory=psycopg2.extras.DictCursor,
-    )
-    conn.autocommit = False  # we control commits
-
-    # Build/patch schema in one transaction
-    try:
-        with conn.cursor() as cursor:
-            # ─── veil_messages ───────────────────────────────────────────────
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS veil_messages (
-                    id SERIAL PRIMARY KEY,
-                    message_id BIGINT UNIQUE NOT NULL,
-                    channel_id BIGINT NOT NULL,
-                    author_id BIGINT NOT NULL,
-                    content TEXT NOT NULL,
-                    timestamp TIMESTAMPTZ DEFAULT NOW()
-                )
-            """)
-
-            cursor.execute("""
-                SELECT column_name
-                  FROM information_schema.columns
-                 WHERE table_name = 'veil_messages'
-            """)
-            cols = {row[0] for row in cursor.fetchall()}
-            if 'guess_count'  not in cols: cursor.execute("ALTER TABLE veil_messages ADD COLUMN guess_count INTEGER DEFAULT 0")
-            if 'is_unveiled'  not in cols: cursor.execute("ALTER TABLE veil_messages ADD COLUMN is_unveiled BOOLEAN DEFAULT FALSE")
-            if 'veil_number'  not in cols: cursor.execute("ALTER TABLE veil_messages ADD COLUMN veil_number INTEGER")
-            if 'is_image'     not in cols: cursor.execute("ALTER TABLE veil_messages ADD COLUMN is_image BOOLEAN NOT NULL DEFAULT FALSE")
-            if 'frame_key'    not in cols: cursor.execute("ALTER TABLE veil_messages ADD COLUMN frame_key TEXT")
-            if 'pan_x'        not in cols: cursor.execute("ALTER TABLE veil_messages ADD COLUMN pan_x INTEGER")
-            if 'pan_y'        not in cols: cursor.execute("ALTER TABLE veil_messages ADD COLUMN pan_y INTEGER")
-            if 'nudge_x'      not in cols: cursor.execute("ALTER TABLE veil_messages ADD COLUMN nudge_x INTEGER")
-            if 'nudge_y'      not in cols: cursor.execute("ALTER TABLE veil_messages ADD COLUMN nudge_y INTEGER")
-            if 'prepared_png' not in cols: cursor.execute("ALTER TABLE veil_messages ADD COLUMN prepared_png BYTEA")
-            if 'image_mime'   not in cols: cursor.execute("ALTER TABLE veil_messages ADD COLUMN image_mime TEXT")
-
-            cursor.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_vm_channel_veilno
-                ON veil_messages(channel_id, veil_number)
-            """)
-
-            # ─── per-guild settings / counters ───────────────────────────────
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS veil_settings (
-                    guild_id    BIGINT PRIMARY KEY,
-                    max_guesses SMALLINT NOT NULL DEFAULT 3 CHECK (max_guesses BETWEEN 1 AND 3)
-                )
-            """)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS veil_channel_counters (
-                    channel_id BIGINT PRIMARY KEY,
-                    current_number INTEGER NOT NULL DEFAULT 0
-                )
-            """)
-
-            # ─── veil_guesses ────────────────────────────────────────────────
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS veil_guesses (
-                    id SERIAL PRIMARY KEY,
-                    message_id BIGINT NOT NULL,
-                    guesser_id BIGINT NOT NULL,
-                    guessed_user_id BIGINT NOT NULL,
-                    timestamp TIMESTAMPTZ DEFAULT NOW(),
-                    UNIQUE (message_id, guesser_id)
-                )
-            """)
-            cursor.execute("""
-                SELECT column_name
-                  FROM information_schema.columns
-                 WHERE table_name = 'veil_guesses'
-            """)
-            guess_cols = {row[0] for row in cursor.fetchall()}
-            if 'is_correct' not in guess_cols:
-                cursor.execute("ALTER TABLE veil_guesses ADD COLUMN is_correct BOOLEAN NOT NULL DEFAULT FALSE")
-
-            # ─── latest_veil_messages / users / channels / admin channels ───
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS latest_veil_messages (
-                    channel_id BIGINT PRIMARY KEY,
-                    message_id BIGINT NOT NULL
-                )
-            """)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS veil_users (
-                    user_id BIGINT NOT NULL,
-                    guild_id BIGINT NOT NULL,
-                    coins INTEGER DEFAULT 0,
-                    veils_unveiled INTEGER DEFAULT 0,
-                    last_reset TIMESTAMPTZ DEFAULT NOW(),
-                    PRIMARY KEY (user_id, guild_id)
-                )
-            """)
-            cursor.execute("""
-                SELECT column_name
-                  FROM information_schema.columns
-                 WHERE table_name = 'veil_users'
-            """)
-            user_cols = {row[0] for row in cursor.fetchall()}
-            if 'last_refill'        not in user_cols: cursor.execute("ALTER TABLE veil_users ADD COLUMN last_refill TIMESTAMPTZ")
-            if 'topgg_last_vote_at' not in user_cols: cursor.execute("ALTER TABLE veil_users ADD COLUMN topgg_last_vote_at TIMESTAMPTZ")
-
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS veil_channels (
-                    guild_id BIGINT PRIMARY KEY,
-                    channel_id BIGINT NOT NULL
-                )
-            """)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS veil_admin_channels (
-                    guild_id BIGINT PRIMARY KEY,
-                    channel_id BIGINT NOT NULL
-                )
-            """)
-
-            # ─── subscriptions ───────────────────────────────────────────────
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS veil_subscriptions (
-                    guild_id BIGINT PRIMARY KEY,
-                    tier TEXT NOT NULL DEFAULT 'free',
-                    subscribed_at TIMESTAMPTZ DEFAULT NOW(),
-                    renews_at TIMESTAMPTZ,
-                    payment_failed BOOLEAN DEFAULT FALSE
-                )
-            """)
-            cursor.execute("""
-                SELECT column_name
-                  FROM information_schema.columns
-                 WHERE table_name = 'veil_subscriptions'
-            """)
-            sub_cols = {row[0] for row in cursor.fetchall()}
-            if 'subscription_id' not in sub_cols:
-                cursor.execute("ALTER TABLE veil_subscriptions ADD COLUMN subscription_id TEXT")
-
-            # ─── coin checkout sessions ──────────────────────────────────────
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS coin_checkout_sessions (
-                    stripe_session_id TEXT PRIMARY KEY,
-                    interaction_token TEXT NOT NULL,
-                    application_id   BIGINT NOT NULL,
-                    user_id          BIGINT NOT NULL,
-                    guild_id         BIGINT NOT NULL,
-                    coins            INTEGER NOT NULL,
-                    created_at       TIMESTAMPTZ DEFAULT NOW()
-                )
-            """)
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_coin_checkout_sessions_created_at
-                ON coin_checkout_sessions (created_at)
-            """)
-
-            # ─── top.gg vote sessions + vote events ─────────────────────────
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS topgg_vote_sessions (
-                    id SERIAL PRIMARY KEY,
-                    user_id BIGINT NOT NULL,
-                    guild_id BIGINT NOT NULL,
-                    interaction_token TEXT NOT NULL,
-                    application_id BIGINT NOT NULL,
-                    created_at TIMESTAMPTZ DEFAULT NOW(),
-                    used BOOLEAN NOT NULL DEFAULT FALSE
-                )
-            """)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS vote_events (
-                    id        BIGSERIAL PRIMARY KEY,
-                    provider  TEXT NOT NULL,
-                    user_id   BIGINT NOT NULL,
-                    guild_id  BIGINT NOT NULL,
-                    voted_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    nonce     TEXT UNIQUE
-                )
-            """)
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS vote_events_voted_at_idx ON vote_events (voted_at);
-            """)
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS vote_events_user_id_idx ON vote_events (user_id);
-            """)
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS vote_events_user_month_idx ON vote_events (user_id, voted_at);
-            """)
-
-        conn.commit()
-        # Optional: log where we connected
-        try:
-            params = conn.get_dsn_parameters()
-            print(f"✅ DB connected host={params.get('host')} db={params.get('dbname')} sslmode={params.get('sslmode')}")
-        except Exception:
-            pass
-
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        print(f"Database error during init: {e}")
-        raise
-
-    return conn  # no cursor return
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 @contextlib.contextmanager
 def get_safe_cursor():
-    """Reuses the global connection, pings, reconnects if needed, and commits/rolls back."""
     global conn
-    if conn is None:
-        conn = init_db()
-    else:
-        try:
-            with conn.cursor() as ping:
-                ping.execute("SELECT 1")
-        except (psycopg2.InterfaceError, psycopg2.OperationalError):
-            print("🔁 Reconnecting to database…")
-            conn = init_db()
+    try:
+        # ping to detect a dead connection
+        with conn.cursor() as ping:
+            ping.execute("SELECT 1")
+    except (psycopg2.InterfaceError, psycopg2.OperationalError):
+        # reconnect if needed
+        print("🔁 Reconnecting to database...")
+        conn, _ = init_db()
 
     cur = conn.cursor()
     try:
@@ -281,6 +54,221 @@ def get_safe_cursor():
         raise
     finally:
         cur.close()
+
+def init_db():
+    try:
+        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+        cursor = conn.cursor()
+
+        # ─── veil_messages ─────────────────────────────────────────────────────
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS veil_messages (
+                id SERIAL PRIMARY KEY,
+                message_id BIGINT UNIQUE NOT NULL,
+                channel_id BIGINT NOT NULL,
+                author_id BIGINT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp TIMESTAMPTZ DEFAULT NOW()
+            )
+        ''')
+
+        cursor.execute("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'veil_messages'
+        """)
+        cols = {row[0] for row in cursor.fetchall()}
+
+        if 'guess_count' not in cols:
+            cursor.execute("ALTER TABLE veil_messages ADD COLUMN guess_count INTEGER DEFAULT 0")
+        if 'is_unveiled' not in cols:
+            cursor.execute("ALTER TABLE veil_messages ADD COLUMN is_unveiled BOOLEAN DEFAULT FALSE")
+        if 'veil_number' not in cols:
+            cursor.execute("ALTER TABLE veil_messages ADD COLUMN veil_number INTEGER")
+
+        # 🔹 New image-related fields
+        if 'is_image' not in cols:
+            cursor.execute("ALTER TABLE veil_messages ADD COLUMN is_image BOOLEAN NOT NULL DEFAULT FALSE")
+        if 'frame_key' not in cols:
+            cursor.execute("ALTER TABLE veil_messages ADD COLUMN frame_key TEXT")
+        if 'pan_x' not in cols:
+            cursor.execute("ALTER TABLE veil_messages ADD COLUMN pan_x INTEGER")
+        if 'pan_y' not in cols:
+            cursor.execute("ALTER TABLE veil_messages ADD COLUMN pan_y INTEGER")
+        if 'nudge_x' not in cols:
+            cursor.execute("ALTER TABLE veil_messages ADD COLUMN nudge_x INTEGER")
+        if 'nudge_y' not in cols:
+            cursor.execute("ALTER TABLE veil_messages ADD COLUMN nudge_y INTEGER")
+        if 'prepared_png' not in cols:
+            cursor.execute("ALTER TABLE veil_messages ADD COLUMN prepared_png BYTEA")
+        if 'image_mime' not in cols:
+            cursor.execute("ALTER TABLE veil_messages ADD COLUMN image_mime TEXT")
+
+        cursor.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_vm_channel_veilno
+            ON veil_messages(channel_id, veil_number)
+        """)
+
+        # simple per-channel counter; we store the *last assigned* number
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS veil_settings (
+                guild_id    BIGINT PRIMARY KEY,
+                max_guesses SMALLINT NOT NULL DEFAULT 3 CHECK (max_guesses BETWEEN 1 AND 3)
+        """)
+
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS veil_channel_counters (
+                channel_id BIGINT PRIMARY KEY,
+                current_number INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+
+        
+        # ─── veil_guesses ──────────────────────────────────────────────────────
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS veil_guesses (
+                id SERIAL PRIMARY KEY,
+                message_id BIGINT NOT NULL,
+                guesser_id  BIGINT NOT NULL,
+                guessed_user_id BIGINT NOT NULL,
+                timestamp TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE (message_id, guesser_id)
+            )
+        ''')
+
+        # Ensure is_correct column exists
+        cursor.execute("""
+            SELECT column_name
+              FROM information_schema.columns
+             WHERE table_name = 'veil_guesses'
+        """)
+        guess_cols = {row[0] for row in cursor.fetchall()}
+        if 'is_correct' not in guess_cols:
+            cursor.execute(
+                "ALTER TABLE veil_guesses ADD COLUMN is_correct BOOLEAN NOT NULL DEFAULT FALSE"
+            )
+
+        # ─── latest_veil_messages, veil_users, veil_channels, etc. ─────────────
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS latest_veil_messages (
+                channel_id BIGINT PRIMARY KEY,
+                message_id BIGINT NOT NULL
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS veil_users (
+                user_id BIGINT NOT NULL,
+                guild_id BIGINT NOT NULL,
+                coins INTEGER DEFAULT 0,
+                veils_unveiled INTEGER DEFAULT 0,
+                last_reset TIMESTAMPTZ DEFAULT NOW(),
+                PRIMARY KEY (user_id, guild_id)
+            )
+        ''')
+        cursor.execute("""
+            SELECT column_name
+              FROM information_schema.columns
+             WHERE table_name = 'veil_users'
+        """)
+        user_cols = {row[0] for row in cursor.fetchall()}
+        if 'last_refill' not in user_cols:
+            cursor.execute("ALTER TABLE veil_users ADD COLUMN last_refill TIMESTAMPTZ")
+        
+        # 🔹 NEW: track the last top.gg vote time
+        if 'topgg_last_vote_at' not in user_cols:
+            cursor.execute("ALTER TABLE veil_users ADD COLUMN topgg_last_vote_at TIMESTAMPTZ")
+
+        # ─── ROLLING VOTE LOG (for monthly leaderboards + history) ────────────
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS vote_events (
+                id        BIGSERIAL PRIMARY KEY,
+                provider  TEXT NOT NULL, 
+                user_id   BIGINT NOT NULL,
+                guild_id  BIGINT NOT NULL,
+                voted_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+                nonce     TEXT UNIQUE
+            )
+        ''')
+
+        # Helpful indexes for common queries
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS vote_events_voted_at_idx
+            ON vote_events (voted_at)
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS vote_events_user_id_idx
+            ON vote_events (user_id)
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS vote_events_user_month_idx
+            ON vote_events (user_id, voted_at)
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS veil_channels (
+                guild_id BIGINT PRIMARY KEY,
+                channel_id BIGINT NOT NULL
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS veil_admin_channels (
+                guild_id BIGINT PRIMARY KEY,
+                channel_id BIGINT NOT NULL
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS veil_subscriptions (
+                guild_id BIGINT PRIMARY KEY,
+                tier TEXT NOT NULL DEFAULT 'free',
+                subscribed_at TIMESTAMPTZ DEFAULT NOW(),
+                renews_at TIMESTAMPTZ,
+                payment_failed BOOLEAN DEFAULT FALSE
+            )
+        ''')
+        cursor.execute("""
+            SELECT column_name
+              FROM information_schema.columns
+             WHERE table_name = 'veil_subscriptions'
+        """)
+        sub_cols = {row[0] for row in cursor.fetchall()}
+        if 'subscription_id' not in sub_cols:
+            cursor.execute("ALTER TABLE veil_subscriptions ADD COLUMN subscription_id TEXT")
+
+        # ─── coin_checkout_sessions (for editing ephemeral after purchase) ───
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS coin_checkout_sessions (
+                stripe_session_id TEXT PRIMARY KEY,
+                interaction_token TEXT NOT NULL,
+                application_id   BIGINT NOT NULL,
+                user_id          BIGINT NOT NULL,
+                guild_id         BIGINT NOT NULL,
+                coins            INTEGER NOT NULL,
+                created_at       TIMESTAMPTZ DEFAULT NOW()
+            )
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_coin_checkout_sessions_created_at
+            ON coin_checkout_sessions (created_at)
+        ''')
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS topgg_vote_sessions (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                guild_id BIGINT NOT NULL,
+                interaction_token TEXT NOT NULL,
+                application_id BIGINT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                used BOOLEAN NOT NULL DEFAULT FALSE
+            )
+        """)
+
+        conn.commit()
+        return conn, cursor
+
+    except Exception as e:
+        print(f"Database error: {e}")
+        return None, None
 
 ZWS = "\u200B"
 
@@ -360,64 +348,10 @@ async def on_ready():
     await tree.sync()
     print("✅ Command Tree Synced")
 
-        # 2) Kick off fast per-guild sync in the background for instant visibility
-    client.loop.create_task(per_guild_sync_task())
-
     # Persistent view(s)
     client.add_view(WelcomeView())
     client.add_view(StoreView())
     await hydrate_latest_views()
-
-async def per_guild_sync_task():
-    """Copy globals into every guild and sync per-guild with pacing + backoff."""
-    guilds = list(client.guilds)
-    total = len(guilds)
-    if not total:
-        return
-
-    print(f"🚀 Starting per-guild sync for {total} guild(s) …")
-    # optional: small initial delay so other startup tasks can breathe
-    await asyncio.sleep(1.0)
-
-    # Copy once, then sync each guild
-    for idx, g in enumerate(guilds, start=1):
-        try:
-            tree.copy_global_to(guild=g)  # ensures the command set is applied to this guild
-            await _sync_one_guild(g)
-        except Exception as e:
-            print(f"⚠️ sync failed for {g.id} ({g.name}): {e}")
-
-        # gentle pacing; 0.25–0.40s is usually enough
-        await asyncio.sleep(0.33)
-
-        if idx % 25 == 0:
-            print(f"… progress: {idx}/{total} guilds synced")
-
-    print("✅ Per-guild sync complete")
-
-
-async def _sync_one_guild(guild, *, max_retries: int = 4):
-    """Sync a single guild with exponential backoff on 429/5xx."""
-    delay = 0.75
-    for attempt in range(max_retries):
-        try:
-            await tree.sync(guild=guild)
-            return
-        except HTTPException as e:
-            # If rate limited or transient, back off and retry
-            if e.status in (429, 500, 502, 503, 504):
-                # If Discord returns a Retry-After header, honor it
-                retry_after = getattr(e, "retry_after", None)
-                sleep_for = float(retry_after) if retry_after else delay
-                await asyncio.sleep(sleep_for)
-                delay = min(delay * 2, 8.0)
-                continue
-            raise  # other HTTP errors -> surface
-        except app_commands.CommandSyncFailure:
-            # transient; try again with backoff
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, 8.0)
-            continue
 
 OWNER_IDS = {568583831985061918}  # <-- your Discord user ID(s)
 SUPPORT_SERVER_ID = 1394932709394087946  # Your support server ID
@@ -551,42 +485,6 @@ FONT_MAP = {
 
 MAX_SRC_LONG = 1600  # pick your comfort number
 
-
-def get_max_guesses(guild_id: int) -> int:
-    try:
-        with get_safe_cursor() as cur:
-            cur.execute("SELECT max_guesses FROM veil_settings WHERE guild_id=%s", (guild_id,))
-            row = cur.fetchone()
-            if not row:
-                # ensure a default row exists; future reads hit the table
-                cur.execute("""
-                    INSERT INTO veil_settings (guild_id, max_guesses)
-                    VALUES (%s, 3)
-                    ON CONFLICT (guild_id) DO NOTHING
-                """, (guild_id,))
-                return 3
-            val = int(row[0])
-            return 3 if val < 1 or val > 3 else val
-    except Exception:
-        return 3
-
-def set_max_guesses(guild_id: int, value: int) -> int:
-    value = max(1, min(3, int(value)))
-    with get_safe_cursor() as cur:
-        cur.execute("""
-            INSERT INTO veil_settings (guild_id, max_guesses)
-            VALUES (%s, %s)
-            ON CONFLICT (guild_id) DO UPDATE SET max_guesses = EXCLUDED.max_guesses
-        """, (guild_id, value))
-    return value
-
-def ensure_settings_row(guild_id: int):
-    with get_safe_cursor() as cur:
-        cur.execute("""
-            INSERT INTO veil_settings (guild_id, max_guesses)
-            VALUES (%s, 3)
-            ON CONFLICT (guild_id) DO NOTHING
-        """, (guild_id,))
 
 def _safe_display_name(member):
     return member.display_name if member else None
@@ -1124,22 +1022,22 @@ def build_frozen_view(msg_id: int, guild: discord.Guild):
         channel_id, guess_count, is_unveiled, author_id, veil_number = row
         author_member = guild.get_member(author_id)
 
-        # NEW: read cap per guild
-        cap = get_max_guesses(guild.id)
+        # Build the base view with the correct per-channel number
+        view = VeilView(veil_number=veil_number)
 
-        view = VeilView(veil_number=veil_number, max_guesses=cap, guess_count=guess_count)
-
+        # Update labels / disablements
         for child in list(view.children):
             if isinstance(child, discord.ui.Button):
                 if child.custom_id == "guess_count":
-                    child.label = f"Guesses {guess_count}/{cap}"
+                    child.label = f"Guesses {guess_count}/3"
                 elif child.custom_id == "submitted_by":
                     if is_unveiled and author_member:
                         display_name = get_display_name_safe(author_member)
                         child.label = f"Submitted by {display_name.capitalize()}"
                 elif child.custom_id == "guess_btn":
-                    child.disabled = is_unveiled or (guess_count >= cap)
+                    child.disabled = is_unveiled or guess_count >= 3
                 elif child.custom_id == "new_btn":
+                    # ✅ Use the *channel* to check latest
                     if not is_latest_veil(channel_id, msg_id):
                         view.remove_item(child)
 
@@ -2328,8 +2226,7 @@ async def send_veil_message(
 
         # send the new veil
         veil_no = claim_next_veil_number(channel_obj.id)
-        cap = get_max_guesses(interaction.guild.id)        # ← NEW
-        view = VeilView(veil_number=veil_no, max_guesses=cap, guess_count=0)
+        view = VeilView(veil_number=veil_no)
         file_main = discord.File(io.BytesIO(img_bytes), filename="veil.png")
         msg = await channel_obj.send(file=file_main, view=view)
 
@@ -2541,8 +2438,7 @@ async def send_veil_message(
 
     # 2️⃣ Send the new Veil message
     veil_no = claim_next_veil_number(channel_obj.id)
-    cap = get_max_guesses(interaction.guild.id)          # NEW
-    view = VeilView(veil_number=veil_no, max_guesses=cap, guess_count=0)  # NEW
+    view = VeilView(veil_number=veil_no)
     file_main = discord.File(io.BytesIO(img_bytes), filename="veil.png")
     msg = await channel_obj.send(file=file_main, view=view)
 
@@ -2686,16 +2582,18 @@ class NewVeilButton(Button):
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(VeilModal())
 
+# 🎨 COMBINED VIEW FOR VEIL MESSAGE
 class VeilView(discord.ui.View):
-    def __init__(self, veil_number: int | None = None, *, max_guesses: int = 3, guess_count: int = 0):
+    def __init__(self, veil_number: int | None = None):
         super().__init__(timeout=None)
         unveil = client.app_emojis['unveilemoji']
 
         self.add_item(discord.ui.Button(style=discord.ButtonStyle.secondary, label="Unveil", custom_id="guess_btn", emoji=unveil))
         self.add_item(NewVeilButton())
-        self.add_item(discord.ui.Button(label=f"Guesses {guess_count}/{max_guesses}", style=discord.ButtonStyle.secondary, disabled=True, custom_id="guess_count"))
+        self.add_item(discord.ui.Button(label="Guesses 0/3", style=discord.ButtonStyle.secondary, disabled=True, custom_id="guess_count"))
         self.add_item(discord.ui.Button(label="Submitted by █████", style=discord.ButtonStyle.secondary, disabled=True, custom_id="submitted_by"))
 
+        # New: “Veil #N” badge
         num_label = f"Veil #{veil_number}" if veil_number else "Veil #–"
         self.add_item(discord.ui.Button(label=num_label, style=discord.ButtonStyle.secondary, disabled=True, custom_id="veil_number"))
 
@@ -2740,8 +2638,6 @@ class UnveilDropdown(discord.ui.Select):
         tier = get_subscription_tier(guild_id)
         is_elite = (tier == "elite")
 
-        cap = get_max_guesses(guild_id)
-        
         # 1) Quick ACK
         try:
             await interaction.response.edit_message(
@@ -2799,11 +2695,11 @@ class UnveilDropdown(discord.ui.Select):
                 )
 
             guess_count, real_author_id, is_unveiled = row
-            if is_unveiled or guess_count >= cap:
+            if is_unveiled or guess_count >= 3:
                 return await interaction.edit_original_response(
                     embed=discord.Embed(
                         title=f"{incorrectmoji} No More Guesses",
-                        description=f"This veil is already unveiled or has {cap} guesses.",
+                        description="This veil is already unveiled or has 3 guesses.",
                         color=0x992d22
                     ),
                     view=None
@@ -2884,9 +2780,9 @@ class UnveilDropdown(discord.ui.Select):
         for child in view.children:
             if isinstance(child, discord.ui.Button):
                 if child.custom_id == "guess_count":
-                    child.label = f"Guesses {guess_count}/{cap}"
-                    child.disabled = True if (is_correct and won) or guess_count >= cap else child.disabled
-                elif child.custom_id == "guess_btn" and ((is_correct and won) or guess_count >= cap):
+                    child.label = f"Guesses {guess_count}/3"
+                    child.disabled = True if (is_correct and won) or guess_count >= 3 else child.disabled
+                elif child.custom_id == "guess_btn" and ((is_correct and won) or guess_count >= 3):
                     child.disabled = True
 
         # 5) Outcomes
@@ -2970,7 +2866,7 @@ class UnveilDropdown(discord.ui.Select):
                     child.disabled = True
             for child in view.children:
                 if isinstance(child, discord.ui.Button) and child.custom_id == "guess_count":
-                    child.label = f"Guesses {guess_count}/{cap}"
+                    child.label = f"Guesses {guess_count}/3"
                     child.disabled = True
 
             # apply the unveiled art
@@ -3005,11 +2901,11 @@ class UnveilDropdown(discord.ui.Select):
                 view=None
             )
 
-        if guess_count >= cap:
+        if guess_count >= 3:
             await msg.edit(view=view)
             return await interaction.edit_original_response(
                 embed=discord.Embed(
-                    title=f"{incorrectmoji} {cap} Guesses Used",
+                    title=f"{incorrectmoji} 3 Guesses Used",
                     description="The veil remains on this message.",
                     color=0x992d22
                 ),
@@ -4582,34 +4478,6 @@ async def store_error(interaction: discord.Interaction, error):
 async def help_command(interaction: discord.Interaction):
     embed = build_help_embed(interaction.guild)
     await interaction.response.send_message(embed=embed, view=HelpView(interaction.user), ephemeral=True)
-
-
-@tree.command(name="maxguess", description="(Admin) Set the max guesses per veil (1–3)")
-@app_commands.describe(guesses="Number of guesses allowed (1–3)")
-@app_commands.checks.has_permissions(administrator=True)
-async def maxguess_cmd(interaction: discord.Interaction, guesses: app_commands.Range[int, 1, 3]):
-    val = set_max_guesses(interaction.guild.id, guesses)
-    await interaction.response.send_message(
-        embed=discord.Embed(
-            title="🛠️ Max Guesses Updated",
-            description=f"Users now have **{val}** guess{'es' if val>1 else ''} per veil.",
-            color=0xeeac00
-        ),
-        ephemeral=True
-    )
-
-@maxguess_cmd.error
-async def maxguess_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.errors.MissingPermissions):
-        incorrectmoji = str(client.app_emojis.get("veilincorrect", "❌"))
-        await interaction.response.send_message(
-            embed=discord.Embed(
-                title=f"{incorrectmoji} Admin Only",
-                description="You must be an **administrator** to run this command.",
-                color=0x992d22
-            ),
-            ephemeral=True
-        )
 
 @tree.command(name="remove", description="🗑️ Removes a Veil that violates TOS")
 @app_commands.describe(number="The Veil #")
