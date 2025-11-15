@@ -1190,6 +1190,10 @@ def add_microtransaction_coins(user_id, guild_id, coins_to_add):
         """, (coins_to_add, user_id, guild_id))
         conn.commit()
 
+def is_owner_only(interaction: discord.Interaction) -> bool:
+    """Restrict command to bot owner(s) only."""
+    return interaction.user.id in OWNER_IDS
+
 def is_admin_or_owner(interaction: discord.Interaction) -> bool:
     """Allow server admins OR bot owners to use the command."""
     user = interaction.user
@@ -1203,6 +1207,28 @@ def is_admin_or_owner(interaction: discord.Interaction) -> bool:
         return True
 
     return False
+
+def set_guild_tier_sync(guild_id: int, tier: str):
+    """
+    Upsert this guild's Veil tier in veil_subscriptions.
+    Used for manual fixes if the Stripe webhook missed something.
+    """
+    if tier not in ("free", "basic", "premium", "elite"):
+        raise ValueError(f"Invalid tier: {tier}")
+
+    with psycopg2.connect(DATABASE_URL, sslmode="require") as conn, conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO veil_subscriptions (guild_id, tier, subscribed_at, renews_at, subscription_id, payment_failed)
+            VALUES (%s, %s, NOW(), NULL, NULL, FALSE)
+            ON CONFLICT (guild_id) DO UPDATE
+            SET tier            = EXCLUDED.tier,
+                subscribed_at   = NOW(),
+                renews_at       = EXCLUDED.renews_at,
+                subscription_id = EXCLUDED.subscription_id,
+                payment_failed  = FALSE
+        """, (guild_id, tier))
+
+    print(f"[admin] Forced guild {guild_id} → tier={tier}")
 
 def create_coin_checkout_session(user_id: int, guild_id: int, coins: int) -> stripe.checkout.Session | None:
     price_id = COIN_PRICE_IDS.get(coins)
@@ -4176,6 +4202,53 @@ async def info_error(interaction: discord.Interaction, error: AppCommandError):
                 color=0x992d22
             ),
             ephemeral=True
+        )
+
+@tree.command(
+    name="fix",
+    description="Owner-Only",
+)
+@app_commands.check(is_owner_only)
+@app_commands.describe(
+    guild_id="Guild ID",
+    tier="Tier",
+)
+async def fix_tier_guild(
+    interaction: discord.Interaction,
+    guild_id: str,
+    tier: Literal["free", "basic", "premium", "elite"],
+):
+    # Validate ID
+    try:
+        gid = int(guild_id)
+    except ValueError:
+        await interaction.response.send_message(
+            "❌ That doesn't look like a valid guild ID.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    # Update DB in a thread
+    await asyncio.to_thread(set_guild_tier_sync, gid, tier)
+
+    # Try to get a human-friendly name if the bot is in that guild
+    guild = interaction.client.get_guild(gid)
+    gname = guild.name if guild else "Unknown / not in cache"
+
+    await interaction.followup.send(
+        f"✅ Set guild **{gname}** (`{gid}`) to **{tier.title()}** tier.",
+        ephemeral=True,
+    )
+
+@fix.error
+async def fix_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    from discord.app_commands import CheckFailure
+    if isinstance(error, CheckFailure):
+        await interaction.response.send_message(
+            "❌ Only the bot owner can use this command.",
+            ephemeral=True,
         )
 
 @tree.command(name="leaderboard", description="🏆 Show the top unveilers")
