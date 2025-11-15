@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from psycopg2 import sql
 from copy import deepcopy
 from discord import PartialEmoji
-from typing import Optional
+from typing import Optional, Literal
 from discord.errors import HTTPException
 from bidi.algorithm import get_display
 from io import BytesIO
