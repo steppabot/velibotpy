@@ -4242,8 +4242,10 @@ async def fix_tier_guild(
         ephemeral=True,
     )
 
-@fix.error
-async def fix_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+
+# FIXED — must match the function name, not the slash command name
+@fix_tier_guild.error
+async def fix_tier_guild_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     from discord.app_commands import CheckFailure
     if isinstance(error, CheckFailure):
         await interaction.response.send_message(
