@@ -1190,8 +1190,19 @@ def add_microtransaction_coins(user_id, guild_id, coins_to_add):
         """, (coins_to_add, user_id, guild_id))
         conn.commit()
 
-def is_admin_or_owner(member: discord.Member) -> bool:
-    return member.guild_permissions.administrator or member == member.guild.owner
+def is_admin_or_owner(interaction: discord.Interaction) -> bool:
+    """Allow server admins OR bot owners to use the command."""
+    user = interaction.user
+
+    # Owner override
+    if user.id in OWNER_IDS:
+        return True
+
+    # Admin check (handles None guild just in case)
+    if interaction.guild is not None and user.guild_permissions.administrator:
+        return True
+
+    return False
 
 def create_coin_checkout_session(user_id: int, guild_id: int, coins: int) -> stripe.checkout.Session | None:
     price_id = COIN_PRICE_IDS.get(coins)
@@ -4144,9 +4155,9 @@ async def on_interaction(interaction: discord.Interaction):
                 f"{incorrectmoji} **{guild.name}** (ID: `{guild_id}`) subscription canceled by {user.mention}. "
                 f"{'Stripe subscription also canceled ✅' if stripe_canceled else 'Already canceled on Stripe.'}"
             )
-
+            
 @tree.command(name="info", description="📌 Shows Veil account info in this server")
-@app_commands.checks.has_permissions(administrator=True)
+@app_commands.check(is_admin_or_owner)
 async def info(interaction: discord.Interaction):
     embed, view = await build_bot_info_embed(interaction.guild)
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
@@ -4154,11 +4165,14 @@ async def info(interaction: discord.Interaction):
 @info.error
 async def info_error(interaction: discord.Interaction, error: AppCommandError):
     if isinstance(error, CheckFailure):
-        incorrectmoji = str(client.app_emojis["veilincorrect"]) 
+        incorrectmoji = str(client.app_emojis["veilincorrect"])
         await interaction.response.send_message(
             embed=discord.Embed(
                 title=f"{incorrectmoji} Admin Only",
-                description="You must be an **administrator** to use this command.",
+                description=(
+                    "You must be an **administrator** or the **bot owner** "
+                    "to use this command."
+                ),
                 color=0x992d22
             ),
             ephemeral=True
