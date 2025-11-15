@@ -1193,17 +1193,28 @@ def add_microtransaction_coins(user_id, guild_id, coins_to_add):
 def is_owner_only(interaction: discord.Interaction) -> bool:
     """Restrict command to bot owner(s) only."""
     return interaction.user.id in OWNER_IDS
-
-def is_admin_or_owner(interaction: discord.Interaction) -> bool:
-    """Allow server admins OR bot owners to use the command."""
-    user = interaction.user
+    
+def is_admin_or_owner(obj: Union[discord.Interaction, discord.abc.User, discord.Member]) -> bool:
+    """
+    Allow server admins OR bot owners to use the command.
+    Works with either an Interaction or a Member/User.
+    """
+    # If it's an Interaction, extract user + guild from it
+    if isinstance(obj, discord.Interaction):
+        user = obj.user
+        guild = obj.guild
+    else:
+        # Assume it's a Member/User-like
+        user = obj
+        guild = getattr(user, "guild", None)
 
     # Owner override
     if user.id in OWNER_IDS:
         return True
 
     # Admin check (handles None guild just in case)
-    if interaction.guild is not None and user.guild_permissions.administrator:
+    perms = getattr(user, "guild_permissions", None)
+    if guild is not None and perms and perms.administrator:
         return True
 
     return False
